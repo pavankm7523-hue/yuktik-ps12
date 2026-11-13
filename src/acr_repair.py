@@ -364,11 +364,23 @@ def _post_json(url, payload, headers, timeout=60):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _api_key(name):
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
+
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
 def _ask_gemini(prompt):
     model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     data = _post_json(url, {"contents": [{"parts": [{"text": prompt}]}]},
-                      {"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
+                      {"x-goog-api-key": _api_key("GEMINI_API_KEY")})
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
@@ -376,14 +388,14 @@ def _ask_openai(prompt):
     model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
     data = _post_json("https://api.openai.com/v1/chat/completions",
                       {"model": model, "messages": [{"role": "user", "content": prompt}]},
-                      {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"})
+                      {"Authorization": f"Bearer {_api_key('OPENAI_API_KEY')}"})
     return data["choices"][0]["message"]["content"]
 
 
 def _ask_anthropic(prompt):
     import anthropic
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=_api_key("ANTHROPIC_API_KEY"))
     resp = client.beta.messages.create(
         model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5"),
         max_tokens=16000,
@@ -405,7 +417,7 @@ PROVIDERS = [
 
 def llm_provider():
     for env, name, _ in PROVIDERS:
-        if os.environ.get(env):
+        if _api_key(env):
             return name
     return None
 
@@ -418,7 +430,7 @@ def _extract_code(reply):
 def llm_patch(code, ctx, ranked, lang="python"):
     """returns (patched_source, provider). raises on network or api errors so the caller can log them."""
     for env, name, ask in PROVIDERS:
-        if not os.environ.get(env):
+        if not _api_key(env):
             continue
         prompt = PROMPT.format(
             lang_name=LANG_NAMES[lang], hint=LANG_HINTS[lang], fence="cpp" if lang == "cpp" else lang,
