@@ -14,15 +14,16 @@ TFIDF_PATH = MODEL_DIR / "tfidf_line.pkl"
 # live in exactly those tokens, so literals are normalised but operators are kept.
 _STR = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
 _NUM = re.compile(r"\b\d+(?:\.\d+)?\b")
-_TOKEN = re.compile(r"<str>|<num>|[A-Za-z_]\w*|==|!=|<=|>=|//|\*\*|<<|>>|[-+*/%&|^~<>=\[\](){}.,:]")
+_TOKEN = re.compile(r"<str>|<num>|[A-Za-z_$][\w$]*|===|!==|&&|\|\||\+\+|--|->|[-+*/%&|^]=|==|!=|<=|>=|//|\*\*|<<|>>"
+                    r"|[-+*/%&|^~<>=\[\](){}.,:;?!]")
 
 W_TOKEN = 0.5
 W_AST = 0.5
 
 
-def preprocess_line(line):
+def preprocess_line(line, lang="python"):
     line = _STR.sub("<str>", line)
-    line = line.split("#", 1)[0]
+    line = line.split("#" if lang == "python" else "//", 1)[0]
     line = _NUM.sub("<num>", line)
     return line.strip()
 
@@ -129,21 +130,89 @@ def _ast_signals(tree):
     return signals, owner
 
 
-def rank_lines(code, model=None, exclude_program=None):
+# language rules: (pattern, signal, weight). checked per line after literals are masked.
+# NUM and STR stand for masked literals, see rule_signals.
+_RULES = {
+    "java": [
+        (r"\bfor\s*\(.*;\s*\w+\s*<=\s*[\w.]+(?:\.length|\.size\(\))", "loop_bound_off_by_one", 0.35),
+        (r"(?:STR|\b[A-Z]\w*\b|\w+\.\w+\(\))\s*[!=]=|[!=]=\s*(?:STR|\b[a-z]\w*\.(?:get|name|toString)\()",
+         "reference_equality", 0.45),
+        (r"\^", "bitwise_xor", 0.4),
+        (r"\.get\(\s*\w+\s*(?:[-+]\s*\w+\s*)?\)", "list_get_bounds", 0.3),
+        (r"\b[a-z]\w*\.\w+", "null_dereference", 0.1),
+        (r"\[\s*\w+\s*(?:[-+]\s*\w+\s*)?\]", "array_index", 0.25),
+    ],
+    "c": [
+        (r"\b(?:if|while)\s*\([^)]*[^=!<>]=[^=][^)]*\)", "assignment_in_condition", 0.6),
+        (r"\bfor\s*\(.*;\s*\w+\s*<=\s*\w+", "loop_bound_off_by_one", 0.4),
+        (r"\[\s*\w+\s*(?:[-+]\s*\w+\s*)?\]", "array_index", 0.25),
+        (r"^\s*[\w:<>]+\s*\*\s*\w+\s*;|^\s*\w+\s+\w+\s*\[\s*NUM\s*\]\s*;|^\s*(?:int|double|float|char|long)\s+\w+\s*;",
+         "uninitialised_storage", 0.3),
+        (r"\bNUM\s*/\s*NUM\b|/\s*NUM\b", "integer_division", 0.35),
+        (r"\^|[^&]&[^&=]|[^|]\|[^|=]", "bitwise_op", 0.3),
+    ],
+    "javascript": [
+        (r"[^=!]==[^=]|!=[^=]", "loose_equality", 0.45),
+        (r"\bfor\s*\(.*;\s*\w+\s*<=\s*[\w.]+\.length", "loop_bound_off_by_one", 0.45),
+        (r"\.(?:forEach|map)\(\s*async|\bawait\b.*\bforEach\b", "async_in_iterator", 0.4),
+        (r"\.(?:sort|reverse|splice|push|pop|shift)\(", "in_place_mutation", 0.2),
+        (r"\[\s*\w+\s*(?:[-+]\s*\w+\s*)?\]", "array_index", 0.2),
+        (r"\bvar\b", "function_scoped_var", 0.15),
+    ],
+}
+_RULES["cpp"] = _RULES["c"] + [(r"\bdelete\b|\bnew\b", "manual_memory", 0.2)]
+_SHARED = [
+    (r"(?<![<>])[<>]=?(?![<>])", "boundary_compare", 0.3),
+    (r"[-+]\s*NUM\b", "off_by_one", 0.2),
+    (r"\breturn\b", "return_value", 0.15),
+    (r"\b(?:if|while)\s*\(", "branch_condition", 0.15),
+    (r"[-+*/%&|^]=|\+\+|--", "aug_assign", 0.1),
+]
+_OWNER = [("for", "For"), ("while", "While"), ("if", "If"), ("else", "If"), ("return", "Return"),
+          ("case", "Case"), ("switch", "Switch"), ("throw", "Raise")]
+
+
+def rule_signals(text, lang):
+    """language rule hits for one source line, masked like the token model sees it."""
+    line = preprocess_line(text, lang).replace("<num>", "NUM").replace("<str>", "STR")
+    hits = {}
+    for pattern, name, weight in _RULES.get(lang, []) + _SHARED:
+        if re.search(pattern, line):
+            hits[name] = max(weight, hits.get(name, 0.0))
+    return hits
+
+
+def _brace_owner(text):
+    s = text.strip()
+    for kw, name in _OWNER:
+        if re.match(r"(?:\}\s*)?" + kw + r"\b", s):
+            return name
+    if s.endswith("{"):
+        return "FunctionDef" if "(" in s else "ClassDef"
+    return "Assign" if re.search(r"[^=!<>]=[^=]", s) else "Expr"
+
+
+def rank_lines(code, model=None, exclude_program=None, lang="python"):
     """rank code lines by suspicion. pass exclude_program to score a quixbugs file without having trained on it."""
-    if exclude_program:
+    if exclude_program and lang == "python":
         model = fit_token_model(exclude=exclude_program)
     model = model or load_token_model()
-    try:
-        signals, owner = _ast_signals(ast.parse(code))
-    except SyntaxError:
+    if lang == "python":
+        try:
+            signals, owner = _ast_signals(ast.parse(code))
+        except SyntaxError:
+            signals, owner = {}, {}
+    else:
         signals, owner = {}, {}
+        for no, text in code_lines(code, lang):
+            signals[no] = rule_signals(text, lang)
+            owner[no] = _brace_owner(text)
 
     rows = []
-    for no, text in code_lines(code):
+    for no, text in code_lines(code, lang):
         sig = signals.get(no, {})
         ast_part = 1.0 - float(np.prod([1.0 - w for w in sig.values()])) if sig else 0.0
-        tok_part = token_score(text, model)
+        tok_part = token_score(text if lang == "python" else preprocess_line(text, lang), model)
         score = W_TOKEN * tok_part + W_AST * ast_part
         rows.append({
             "line_no": no,

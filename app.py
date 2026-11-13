@@ -7,25 +7,92 @@ import pandas as pd
 import streamlit as st
 
 from src import benchmark, train_pipeline
-from src.acr_repair import DISCOVERED, REFERENCE, build_context, llm_provider, repair, verify_with_pytest
+from src.acr_repair import DISCOVERED, REFERENCE, build_context, can_execute, llm_provider, repair, verify_with_pytest
 from src.ast_metrics import FEATURE_LABELS, FEATURES
 from src.line_localizer import load_token_model, rank_lines
-from src.quixbugs import BUGGY_DIR, faulty_lines, has_tests, list_programs, read_buggy, read_correct
+from src.quixbugs import faulty_lines, list_programs, program_path, read_buggy, read_correct
+from src.sandbox import _balanced, toolchain
 
 ROOT = Path(__file__).resolve().parent
 MODEL_CHOICES = {"XGBoost (JM1/Halstead)": "xgb", "Random Forest": "rf"}
 
-CUSTOM_CODE = '''def find_max(values):
+LANGS = {"Python": "python", "Java": "java", "JavaScript": "javascript", "C": "c", "C++": "cpp"}
+QUIX_TREES = {"Python (vendor/QuixBugs/python_programs)": "python", "Java (vendor/QuixBugs/java_programs)": "java"}
+HIGHLIGHT = {"python": "python", "java": "java", "javascript": "javascript", "c": "c", "cpp": "cpp"}
+
+# one buggy snippet and matching asserts per language, each with the same off-by-one loop bound
+SAMPLES = {
+    "python": ('''def find_max(values):
     best = values[0]
     for i in range(1, len(values) - 1):
         if values[i] > best:
             best = values[i]
     return best
-'''
-CUSTOM_TESTS = '''assert find_max([1, 2, 3]) == 3
+''', '''assert find_max([1, 2, 3]) == 3
 assert find_max([5, 1, 9]) == 9
 assert find_max([4]) == 4
-'''
+'''),
+    "java": ('''public class MaxFinder {
+    public static int findMax(int[] values) {
+        int best = values[0];
+        for (int i = 1; i < values.length - 1; i++) {
+            if (values[i] > best) {
+                best = values[i];
+            }
+        }
+        return best;
+    }
+}
+''', '''assert MaxFinder.findMax(new int[]{1, 2, 3}) == 3;
+assert MaxFinder.findMax(new int[]{5, 1, 9}) == 9;
+assert MaxFinder.findMax(new int[]{4}) == 4;
+'''),
+    "javascript": ('''function findMax(values) {
+  let best = values[0];
+  for (let i = 1; i < values.length - 1; i++) {
+    if (values[i] > best) {
+      best = values[i];
+    }
+  }
+  return best;
+}
+''', '''assert.strictEqual(findMax([1, 2, 3]), 3);
+assert.strictEqual(findMax([5, 1, 9]), 9);
+assert.strictEqual(findMax([4]), 4);
+'''),
+    "c": ('''int find_max(const int *values, int n) {
+    int best = values[0];
+    for (int i = 1; i < n - 1; i++) {
+        if (values[i] > best) {
+            best = values[i];
+        }
+    }
+    return best;
+}
+''', '''int a[] = {1, 2, 3};
+int b[] = {5, 1, 9};
+int c[] = {4};
+assert(find_max(a, 3) == 3);
+assert(find_max(b, 3) == 9);
+assert(find_max(c, 1) == 4);
+'''),
+    "cpp": ('''#include <vector>
+
+int findMax(const std::vector<int>& values) {
+    int best = values[0];
+    for (size_t i = 1; i < values.size() - 1; i++) {
+        if (values[i] > best) {
+            best = values[i];
+        }
+    }
+    return best;
+}
+''', '''assert(findMax({1, 2, 3}) == 3);
+assert(findMax({5, 1, 9}) == 9);
+assert(findMax({4}) == 4);
+'''),
+}
+
 
 st.set_page_config(page_title="PS12 code intelligence", layout="wide")
 
@@ -52,21 +119,27 @@ def retrain():
 
 
 def run_block(title, run):
-    status = "PASS" if run["passed"] else ("TIMEOUT" if run["timed_out"] else "FAIL")
+    if run["passed"] is None:
+        status = "NOT RUN (static check only)"
+    else:
+        status = "PASS" if run["passed"] else ("TIMEOUT" if run["timed_out"] else "FAIL")
     st.markdown(f"**{title}: {status}**")
-    st.caption(f"exit code {run['exit_code']}, {run['runtime_ms']:.0f} ms, python -m {run['command']}")
+    st.caption(f"exit code {run['exit_code']}, {run['runtime_ms']:.0f} ms, {run['command']}")
     st.code((run["stdout"] + run["stderr"]).strip() or "(no output)", language="text")
 
 
 st.sidebar.header("Input")
-mode = st.sidebar.radio("Source", ["QuixBugs program", "Custom Python Input"])
+mode = st.sidebar.radio("Source", ["QuixBugs program", "Custom Input"])
 program = None
 tests = None
 if mode == "QuixBugs program":
-    program = st.sidebar.selectbox("File in vendor/QuixBugs/python_programs", list_programs())
-    code = read_buggy(program)
-    st.sidebar.caption(str((BUGGY_DIR / f"{program}.py").relative_to(ROOT)))
+    tree = st.sidebar.radio("QuixBugs tree", list(QUIX_TREES))
+    lang = QUIX_TREES[tree]
+    program = st.sidebar.selectbox("Program", list_programs(lang))
+    code = read_buggy(program, lang)
+    st.sidebar.caption(str(program_path(program, lang).relative_to(ROOT)))
 else:
+    lang = LANGS[st.sidebar.selectbox("Language", list(LANGS))]
     code = None
 
 model_label = st.sidebar.selectbox("Classifier", list(MODEL_CHOICES))
@@ -82,37 +155,51 @@ if st.sidebar.button("Re-run src/train_pipeline.py"):
 provider = llm_provider()
 st.sidebar.header("Repair backend")
 st.sidebar.text(f"LLM: {provider}" if provider else "LLM: none (no API key in env)")
+st.sidebar.text("python: fast worker pool\n" + "\n".join(
+    f"{k}: {'found' if v else 'not on PATH, static check only'}" for k, v in toolchain().items()))
 
 st.title("Defect prediction, bug localization and program repair")
 
-if mode == "Custom Python Input":
+if mode == "Custom Input":
+    sample_code, sample_tests = SAMPLES[lang]
+    label = next(k for k, v in LANGS.items() if v == lang)
     left, right = st.columns(2)
-    code = left.text_area("Python source", CUSTOM_CODE, height=220)
-    tests = right.text_area("Assert tests (one per line)", CUSTOM_TESTS, height=220)
+    # keyed per language so switching the selector loads that language's template
+    code = left.text_area(f"{label} source", sample_code, height=260, key=f"code_{lang}")
+    tests = right.text_area("Assert tests (one per line)", sample_tests, height=260, key=f"tests_{lang}")
 
 if not train_pipeline.METRICS_PATH.exists():
     st.warning("No trained models found. Use the sidebar button or run: python -m src.train_pipeline")
     st.stop()
 
-try:
-    compile(code, "<input>", "exec")
-except SyntaxError as exc:
-    st.error(f"Input does not parse: {exc}")
+if lang == "python":
+    try:
+        compile(code, "<input>", "exec")
+    except SyntaxError as exc:
+        st.error(f"Input does not parse: {exc}")
+        st.stop()
+elif not _balanced(code):
+    st.error("Input has unbalanced brackets.")
     st.stop()
 
 stamp = model_stamp()
 metrics = train_pipeline.load_metrics()
-ranked = rank_lines(code, model=get_token_model(stamp), exclude_program=program)
+ranked = rank_lines(code, model=get_token_model(stamp), exclude_program=program if lang == "python" else None,
+                    lang=lang)
 
 tab_pred, tab_loc, tab_fix, tab_bench = st.tabs([
     "Defect Prediction & SHAP",
     "Line Localization (DeepLineDP + AST)",
-    "Program Repair & Pytest Sandbox (AutoCodeRover)",
+    "Program Repair & Test Sandbox (AutoCodeRover)",
     "Benchmark Evaluation",
 ])
 
 with tab_pred:
-    info = train_pipeline.explain_file(code, model_kind, model=get_model(model_kind, stamp))
+    info = train_pipeline.explain_file(code, model_kind, model=get_model(model_kind, stamp), lang=lang)
+    if lang != "python":
+        st.info("The classifiers were trained on Python AST metrics. For this language the same 29 columns come from "
+                "a lexical extractor (Halstead tokens, McCabe branch keywords, brace depth), so the probability is "
+                "a model applied outside the language it was trained on.")
     holdout = metrics["models"][model_kind]
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -138,13 +225,13 @@ with tab_pred:
                  hide_index=True, width="stretch")
     st.caption("An original buggy file and its fix differ by one token and usually have identical metrics, so that "
                "slice is the hard one. Most of the signal comes from the generated variants.")
-    if program:
+    if program and lang == "python":
         side = "holdout" if program in metrics["test_programs"] else "training"
         st.caption(f"{program} is in the {side} programs of this split.")
 
     left, right = st.columns([2, 3])
     with left:
-        st.subheader("JM1 and Python AST metrics")
+        st.subheader("JM1 and AST metrics" if lang == "python" else "JM1 metrics (lexical extractor)")
         table = pd.DataFrame({
             "metric": FEATURES,
             "meaning": [FEATURE_LABELS[f] for f in FEATURES],
@@ -178,10 +265,11 @@ with tab_loc:
         st.dataframe(frame.head(3)[["rank", "line_no", "code", "suspicion_score", "ast_node_type", "signals"]],
                      hide_index=True, width="stretch")
         if program:
-            truth = faulty_lines(code, read_correct(program))
+            truth = faulty_lines(code, read_correct(program, lang), lang)
             hit = [r["rank"] for r in ranked if r["line_no"] in truth]
             st.caption(f"Reference fix touches line(s) {truth}. Best rank of a fixed line: {min(hit) if hit else 'n/a'}. "
-                       "Token weights were refitted without this program before scoring it.")
+                       + ("Token weights were refitted without this program before scoring it." if lang == "python"
+                          else "Token weights come from the Python programs; the Java rules add the language signals."))
 
         st.subheader("Per-line suspicion")
         by_line = frame.sort_values("line_no")[
@@ -191,35 +279,44 @@ with tab_loc:
         st.dataframe(styled, hide_index=True, width="stretch", height=min(700, 38 * (len(by_line) + 1)))
 
         st.subheader("AST context slice")
-        ctx = build_context(code, ranked[0]["line_no"])
+        ctx = build_context(code, ranked[0]["line_no"], lang=lang)
         a, b = st.columns(2)
         a.json({k: ctx.get(k) for k in ("fault_line", "fault_code", "class", "function", "signature", "arguments", "calls")})
         b.dataframe(pd.DataFrame(ctx.get("local_assignments", [])), hide_index=True, width="stretch")
         st.code(ctx.get("snippet", ""), language="text")
 
 with tab_fix:
-    can_test = bool(program and has_tests(program)) or bool(tests and tests.strip())
+    can_test = can_execute(lang, program if lang == "python" else None, tests)
+    if not can_test and lang != "python":
+        st.info(f"No runnable tests for {lang} on this machine "
+                + ("(add assert lines)." if not (tests or "").strip() else "(compiler or runtime not on PATH).")
+                + " Patches are still proposed; the sandbox falls back to a static bracket check.")
     use_llm = st.checkbox("Use LLM when an API key is set", value=bool(provider), disabled=not provider)
     if st.button("Generate patch and run pytest"):
         with st.spinner("searching for a patch"):
-            fix = repair(code, program_name=program, assert_block=tests, ranked=ranked, use_llm=use_llm, timeout=timeout)
+            fix = repair(code, program_name=program, assert_block=tests, ranked=ranked, use_llm=use_llm,
+                         timeout=timeout, lang=lang)
         st.session_state["fix"] = (code, fix)
         if fix["patched"]:
-            with st.spinner("running pytest on both versions"):
-                st.session_state["runs"] = verify_with_pytest(program, code, fix["patched"], tests, timeout) if can_test else None
+            with st.spinner("running the tests on both versions"):
+                st.session_state["runs"] = verify_with_pytest(program, code, fix["patched"], tests, timeout, lang)
 
     saved = st.session_state.get("fix")
     if saved and saved[0] == code:
         fix = saved[1]
         st.text("\n".join(fix["log"]))
         if not fix["patched"]:
-            st.warning("No patch produced. Add assert tests, or set an API key for the LLM path.")
+            if lang != "python" and not can_test:
+                st.warning(f"No patch produced. Candidate edits need a {lang} compiler or runtime to be checked "
+                           "against the asserts, or an API key for the LLM path.")
+            else:
+                st.warning("No patch produced. Add assert tests, or set an API key for the LLM path.")
         else:
             if fix["origin"] == REFERENCE:
                 st.warning("REFERENCE FALLBACK. The tool did not find this patch. It is the known fix copied from "
-                           "vendor/QuixBugs/correct_python_programs and does not count as a repair.")
+                           f"vendor/QuixBugs/correct_{lang}_programs and does not count as a repair.")
             elif fix["validated"]:
-                st.success(f"DISCOVERED by {fix['source']} and validated by pytest. No reference file was used.")
+                st.success(f"DISCOVERED by {fix['source']} and validated by the tests. No reference file was used.")
             else:
                 st.info(f"DISCOVERED by {fix['source']}, but there were no tests to validate it.")
             st.caption(f"Suspect lines sent to repair: {fix['fault_lines']}.")
@@ -227,11 +324,11 @@ with tab_fix:
             st.code(fix["diff"] or "(no textual change)", language="diff")
             a, b = st.columns(2)
             a.subheader("Original")
-            a.code(code, language="python", line_numbers=True)
+            a.code(code, language=HIGHLIGHT[lang], line_numbers=True)
             b.subheader("Patched")
-            b.code(fix["patched"], language="python", line_numbers=True)
+            b.code(fix["patched"], language=HIGHLIGHT[lang], line_numbers=True)
 
-            st.subheader("Pytest sandbox")
+            st.subheader("Test sandbox")
             runs = st.session_state.get("runs")
             if not runs:
                 st.info("No tests available for this input, so the patch was not executed.")
@@ -246,20 +343,27 @@ with tab_fix:
                 "then the QuixBugs reference fix as a fallback. A fallback is labelled as such and is not a repair.")
 
 with tab_bench:
-    names = list_programs()
-    picked = st.multiselect("Programs", names, default=names[:8])
-    c1, c2 = st.columns(2)
-    search = c1.checkbox("Try single-edit AST search before the reference fix", value=True)
+    bench_lang = lang if lang in ("python", "java") else "python"
+    names = list_programs(bench_lang)
+    st.caption(f"Benchmark over vendor/QuixBugs/{bench_lang}_programs. Programs run in parallel "
+               f"({benchmark.WORKERS} workers) and results are cached in data/benchmark_cache.json by "
+               "program, language, code sha1 and llm backend.")
+    picked = st.multiselect("Programs", names, default=names[:8], key=f"bench_{bench_lang}")
+    c1, c2, c3 = st.columns(3)
+    search = c1.checkbox("Try single-edit search before the reference fix", value=True)
     bench_llm = c2.checkbox("Use LLM in benchmark", value=False, disabled=not provider)
+    use_cache = c3.checkbox("Use cached benchmark results (instant) / Force fresh run", value=True)
     if st.button("Run benchmark") and picked:
         bar = st.progress(0.0)
-        df = benchmark.run_benchmark(picked, use_llm=bench_llm, use_search=search, timeout=timeout,
-                                     progress=lambda i, n, name: bar.progress(i / n, text=name))
+        df = benchmark.run_benchmark(picked, use_llm=bench_llm, use_search=search, timeout=timeout, lang=bench_lang,
+                                     use_cache=use_cache, progress=lambda i, n, name: bar.progress(i / n, text=name))
         st.session_state["bench"] = df
     df = st.session_state.get("bench")
     if df is not None:
         s = benchmark.summarize(df)
         n = s["programs"]
+        cached = int(df["cached"].sum())
+        st.caption(f"{cached} rows from cache, {n - cached} computed fresh in {df.attrs.get('seconds', 0.0):.2f}s.")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Top-1 line hit", f"{s['top1_hit']}/{n}")
         c2.metric("Top-3 line hit", f"{s['top3_hit']}/{n}")
@@ -271,13 +375,17 @@ with tab_bench:
             f"{s['discovered_fix']} passed independent pytest verification. The reference file was used for "
             f"{s['reference_fallback']} programs ({s['reference_fallback_passes']} passed pytest); these fallbacks "
             "are excluded from discovered-repair counts."
+            + (f" {s['not_executed']} rows were not executed: no runnable tests for this language on this machine."
+               if s["not_executed"] else "")
         )
         st.subheader("Patch origin breakdown")
         st.dataframe(benchmark.summarize_origins(df), hide_index=True, width="stretch")
 
         def shade(row):
             colour = {DISCOVERED: "background-color: #d9ead3", REFERENCE: "background-color: #fff2cc"}
-            return [colour.get(row["patch_origin"], "") if col in ("patch_origin", "repair_source") else "" for col in row.index]
+            return [colour.get(row["patch_origin"], "") if col in ("patch_origin", "repair_source") else ""
+                    for col in row.index]
 
         st.dataframe(df.style.apply(shade, axis=1), hide_index=True, width="stretch")
-        st.caption("Green = discovered by the tool. Yellow = reference fallback. Line hits use leave-one-out token weights.")
+        st.caption("Green = discovered by the tool. Yellow = reference fallback. Python line hits use leave-one-out "
+                   "token weights.")

@@ -15,7 +15,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 from xgboost import XGBClassifier
 
 from src import mutations
-from src.ast_metrics import FEATURES, JM1_FEATURES, extract_metrics
+from src.ast_metrics import FEATURES, JM1_FEATURES, extract_jm1_metrics, extract_metrics
 from src.line_localizer import TFIDF_PATH, save_token_model
 from src.quixbugs import DATA_DIR, MODEL_DIR, ROOT, VENDOR, list_programs, read_buggy, read_correct
 from src.sandbox import run_quixbugs_tests
@@ -238,11 +238,11 @@ def _positive_class_shap(explainer, X):
     return values[0], float(base[-1])
 
 
-def explain_file(code_str, model_type="xgb", model=None):
+def explain_file(code_str, model_type="xgb", model=None, lang="python"):
     import shap
 
     model = model or load_model(model_type)
-    feats = extract_metrics(code_str)
+    feats = extract_jm1_metrics(code_str, lang)
     X = pd.DataFrame([feats], columns=FEATURES).astype(float)
     proba = float(model.predict_proba(X)[0, 1])
     values, base = _positive_class_shap(shap.TreeExplainer(model), X)

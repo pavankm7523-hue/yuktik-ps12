@@ -2,6 +2,7 @@
 import io
 import keyword
 import math
+import re
 import tokenize
 
 from src.quixbugs import docstring_lines
@@ -191,4 +192,114 @@ def extract_metrics(source):
         "bool_ops": _count(nodes, ast.BoolOp),
         "aug_assigns": _count(nodes, ast.AugAssign),
     }
+    return {k: vals[k] for k in FEATURES}
+
+
+# brace languages: lexical halstead and mccabe, no parser needed
+_KEYWORDS = {
+    "java": "abstract assert boolean break byte case catch char class continue default do double else enum extends "
+            "final finally float for if implements import instanceof int interface long new package private "
+            "protected public return short static super switch this throw throws try void while null true false",
+    "c": "auto break case char const continue default do double else enum extern float for goto if int long "
+         "register return short signed sizeof static struct switch typedef union unsigned void volatile while NULL",
+    "cpp": "auto bool break case catch char class const continue default delete do double else enum false float for "
+           "if int long namespace new nullptr private protected public return short sizeof static struct switch "
+           "template this throw true try typedef typename unsigned using virtual void while std",
+    "javascript": "async await break case catch class const continue default delete do else export extends false "
+                  "finally for function if import in instanceof let new null return switch this throw true try "
+                  "typeof undefined var void while yield of",
+}
+_KEYWORDS = {k: set(v.split()) for k, v in _KEYWORDS.items()}
+_LEX = re.compile(
+    r"(?P<str>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)"
+    r"|(?P<num>\b0[xX][0-9a-fA-F]+\b|\b\d+(?:\.\d+)?[fFlLuU]*\b)"
+    r"|(?P<id>[A-Za-z_$][\w$]*)"
+    r"|(?P<op>>>>=|===|!==|>>>|<<=|>>=|\+\+|--|->|::|&&|\|\||==|!=|<=|>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>"
+    r"|[-+*/%=<>!&|^~?:.,;(){}\[\]])"
+)
+_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+_CMP = {"==", "!=", "===", "!==", "<", "<=", ">", ">="}
+_AUG = {"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>="}
+
+
+def _strip_comments(code):
+    # keep line breaks so line numbers stay aligned
+    return _COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), code)
+
+
+def _lex(code):
+    return [(m.lastgroup, m.group(), code.count("\n", 0, m.start()) + 1) for m in _LEX.finditer(code)]
+
+
+def _brace_metrics(code, lang):
+    clean = _strip_comments(code)
+    toks = _lex(clean)
+    kw = _KEYWORDS[lang]
+    ops, opnds = [], []
+    for kind, text, _ in toks:
+        if kind == "op":
+            if text not in (")", "]", "}"):
+                ops.append(text)
+        elif kind == "id" and text in kw:
+            ops.append(text)
+        else:
+            opnds.append(text)
+    words = [t for k, t, _ in toks if k in ("id", "op")]
+
+    decisions = sum(words.count(w) for w in ("if", "for", "while", "case", "catch", "?", "&&", "||"))
+    exits = sum(words.count(w) for w in ("return", "break", "continue", "throw", "goto"))
+    funcs = max(1, len(re.findall(r"\)\s*(?:throws\s+[\w.,\s]+)?\{", clean)) - words.count("if")
+                - words.count("for") - words.count("while") - words.count("switch") - words.count("catch"))
+    # a name followed by "(" is a call unless a type or name sits right before it (a definition)
+    call_lines = [a[2] for p, a, b in zip(toks, toks[1:], toks[2:])
+                  if a[0] == "id" and b[1] == "(" and a[1] not in kw
+                  and not (p[0] == "id" and p[1] not in ("return", "new", "throw", "await"))]
+    calls = len(call_lines)
+    design = sum(1 for (_, t, ln) in toks if t in ("if", "while", "for") and ln in call_lines)
+
+    depth = best = 0
+    for _, t, _ in toks:
+        if t == "{":
+            depth += 1
+            best = max(best, depth)
+        elif t == "}":
+            depth = max(0, depth - 1)
+
+    lines = [i for i, line in enumerate(clean.splitlines(), start=1) if line.strip()]
+    n1, n2, N1, N2 = len(set(ops)), len(set(opnds)), len(ops), len(opnds)
+    length, vocab = N1 + N2, n1 + n2
+    volume = length * math.log2(vocab) if vocab > 1 else 0.0
+    difficulty = (n1 / 2.0) * (N2 / n2) if n2 else 0.0
+    level = 1.0 / difficulty if difficulty else 0.0
+    effort = difficulty * volume
+    vg = 1 + decisions
+    # essential complexity: early exits beyond one per function
+    evg = min(vg, 1 + max(0, exits - funcs))
+    return {
+        "loc": (lines[-1] - lines[0] + 1) if lines else 0,
+        "v(g)": vg, "ev(g)": evg, "iv(g)": min(vg, 1 + design),
+        "n": length, "v": round(volume, 2), "l": round(level, 3), "d": round(difficulty, 2),
+        "i": round(level * volume, 2), "e": round(effort, 2), "b": round(volume / 3000.0, 3),
+        "t": round(effort / 18.0, 2), "lOCode": len(lines),
+        "uniq_Op": n1, "uniq_Opnd": n2, "total_Op": N1, "total_Opnd": N2,
+        "branchCount": 2 * decisions + 1,
+        # structure counts are lexical stand-ins for the python ast counts
+        "max_nesting": max(0, best - (2 if lang in ("java", "cpp") and "class" in words else 1)),
+        "ast_depth": best + 1, "ast_nodes": len(toks),
+        "loops": words.count("for") + words.count("while"),
+        "conditionals": words.count("if") + words.count("?"),
+        "compares": sum(1 for w in words if w in _CMP),
+        "subscripts": words.count("["), "calls": calls, "returns": words.count("return"),
+        "bool_ops": words.count("&&") + words.count("||"),
+        "aug_assigns": sum(1 for w in words if w in _AUG) + words.count("++") + words.count("--"),
+    }
+
+
+def extract_jm1_metrics(code_str, lang="python"):
+    """jm1-schema metrics for python, java, c, cpp and javascript, same 29 columns for every language."""
+    if lang == "python":
+        return extract_metrics(code_str)
+    if lang not in _KEYWORDS:
+        raise ValueError(f"unsupported language: {lang}")
+    vals = _brace_metrics(code_str, lang)
     return {k: vals[k] for k in FEATURES}

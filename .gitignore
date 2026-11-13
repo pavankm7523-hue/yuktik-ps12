@@ -13,3 +13,8 @@ vendor/DeepLineDP/script/line-level-baseline/
 data/variant_test_cache.json
 .vercel
 .env
+.env.*
+!.env.example
+*.tmp
+*.zip
+.sandbox_*/

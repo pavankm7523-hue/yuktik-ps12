@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from src import mutations
 from src.line_localizer import rank_lines
-from src.quixbugs import SANDBOX_DIR, VENDOR, code_lines, list_programs, read_correct
-from src.sandbox import run_tests
+from src.quixbugs import EXT, SANDBOX_DIR, VENDOR, code_lines, list_programs, read_correct
+from src.sandbox import _balanced, run_tests, toolchain
 
 ACR_SEARCH_UTILS = VENDOR / "auto-code-rover" / "app" / "search" / "search_utils.py"
 
@@ -35,8 +35,10 @@ def _enclosing(spans, line_no):
     return min(inside, key=lambda s: s[2] - s[1]) if inside else None
 
 
-def build_context(code, fault_line, window=4):
+def build_context(code, fault_line, window=4, lang="python"):
     """autocoderover style retrieval: index the file, find the scopes around the fault line, slice the code."""
+    if lang != "python":
+        return brace_context(code, fault_line, window)
     acr = acr_search_utils()
     SANDBOX_DIR.mkdir(exist_ok=True)
     tmp = SANDBOX_DIR / f"ctx_{uuid.uuid4().hex[:10]}.py"
@@ -88,13 +90,166 @@ def build_context(code, fault_line, window=4):
     return ctx
 
 
+def _brace_depths(code):
+    """per line: brace depth at line start, ignoring braces inside strings and comments."""
+    clean = re.sub(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+                   lambda m: re.sub(r"[^\n]", " ", m.group(0)), code, flags=re.S)
+    depth, out = 0, []
+    for line in clean.splitlines():
+        out.append((depth, line))
+        depth += line.count("{") - line.count("}")
+    return out
+
+
+def _block_span(depths, line_no, want):
+    """1-based start and end line of the block opened at depth `want` that contains line_no."""
+    start = None
+    for i in range(line_no - 1, -1, -1):
+        d, text = depths[i]
+        if d == want and "{" in text:
+            start = i + 1
+            break
+        if d < want:
+            break
+    if start is None:
+        return None
+    for j in range(start, len(depths)):
+        # the block closes on the first later line that starts back at its own depth
+        if depths[j][0] <= want:
+            return start, j
+    return start, len(depths)
+
+
+_SIG = re.compile(r"([A-Za-z_$][\w$]*)\s*\(([^()]*)\)\s*(?:const\s*)?(?:throws\s+[\w.,\s]+)?\{?\s*$")
+_CTRL = {"if", "for", "while", "switch", "catch", "else", "do", "try", "synchronized", "return", "sizeof"}
+
+
+def brace_context(code, fault_line, window=4):
+    """brace-balanced method slicing for java, c, cpp and javascript."""
+    lines = code.splitlines()
+    depths = _brace_depths(code)
+    lo, hi = max(1, fault_line - window), min(len(lines), fault_line + window)
+    snippet = "\n".join(f"{i:>4} {lines[i - 1]}" for i in range(lo, hi + 1))
+    ctx = {"fault_line": fault_line, "fault_code": lines[fault_line - 1].strip() if 0 < fault_line <= len(lines) else "",
+           "class": None, "function": None, "function_span": None, "signature": None, "arguments": [],
+           "local_assignments": [], "calls": [], "snippet": snippet, "function_source": "",
+           "indexed": {"classes": re.findall(r"\b(?:class|struct|interface)\s+(\w+)", code),
+                       "functions": sorted({m for m in re.findall(r"\b(\w+)\s*\([^;{()]*\)\s*(?:throws[\w.,\s]+)?\{", code)}
+                                           - _CTRL)}}
+    if not 0 < fault_line <= len(lines):
+        return ctx
+    # walk outwards through the enclosing blocks until one opens with a function signature
+    level = depths[fault_line - 1][0]
+    if "{" in depths[fault_line - 1][1]:
+        level += 1
+    while level > 0:
+        level -= 1
+        span = _block_span(depths, fault_line, level)
+        if not span:
+            continue
+        head = " ".join(depths[i][1].strip() for i in range(max(0, span[0] - 3), span[0])).rstrip().rstrip("{")
+        head = re.split(r"[;{}]", head)[-1].strip()
+        m = _SIG.search(head)
+        if m and m.group(1) not in _CTRL and ctx["function"] is None:
+            ctx["function"], ctx["function_span"] = m.group(1), span
+            ctx["signature"] = head.strip().rstrip("{").strip()
+            ctx["arguments"] = [a.split()[-1].strip("&*[]") for a in m.group(2).split(",") if a.strip()]
+            ctx["function_source"] = "\n".join(lines[span[0] - 1:span[1]])
+        cls = re.search(r"\b(?:class|struct|interface)\s+(\w+)", head)
+        if cls and not ctx["class"]:
+            ctx["class"] = cls.group(1)
+    if ctx["function_span"]:
+        first = ctx["function_span"][0]
+        seen = set()
+        for i, text in enumerate(ctx["function_source"].splitlines()[1:], start=first + 1):
+            m = re.match(r"\s*(?:(?:final|const|let|var|auto|static|unsigned)\s+)*[\w<>\[\],.*&]+\s+\**(\w+)\s*(?:=|;|\[)",
+                         text) or re.match(r"\s*(\w+)\s*(?:[-+*/%^&|]?=)(?!=)", text)
+            if m and m.group(1) not in seen | _CTRL:
+                seen.add(m.group(1))
+                ctx["local_assignments"].append({"name": m.group(1), "line": i, "code": text.strip()})
+        body = "\n".join(ctx["function_source"].splitlines()[1:])
+        ctx["calls"] = sorted({c for c in re.findall(r"\b([A-Za-z_]\w*)\s*\(", body)} - _CTRL)
+    return ctx
+
+
+# operator swaps for brace languages, longest token first so "<=" is never read as "<"
+_SWAPS = [
+    ("===", ["!=="]), ("!==", ["==="]), ("<<=", [">>="]), (">>=", ["<<="]),
+    ("&&", ["||"]), ("||", ["&&"]), ("==", ["!="]), ("!=", ["=="]), ("<=", ["<", ">="]),
+    (">=", [">", "<="]), ("^=", ["&=", "|="]), ("&=", ["|=", "^="]), ("|=", ["&=", "^="]),
+    ("+=", ["-="]), ("-=", ["+="]), ("*=", ["/="]), ("/=", ["*="]), ("++", ["--"]), ("--", ["++"]),
+    ("<<", [">>"]), (">>", ["<<"]), ("<", ["<=", ">"]), (">", [">=", "<"]), ("^", ["&", "|"]),
+    ("&", ["^", "|"]), ("|", ["^", "&"]), ("+", ["-"]), ("-", ["+"]), ("*", ["/"]), ("/", ["*"]), ("%", ["/"]),
+]
+_SWAP = dict(_SWAPS)
+_SWAP_RE = re.compile("|".join(re.escape(a) for a, _ in _SWAPS))
+
+
+def _code_part(line):
+    """the line with string literals blanked and any trailing // comment cut off."""
+    text = re.sub(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", lambda m: " " * len(m.group(0)), line)
+    cut = text.find("//")
+    return text if cut < 0 else text[:cut]
+
+
+def brace_candidates(code, fault_lines, lang, limit=60):
+    """single-token rewrites of the suspicious lines: operator swaps, +-1 on bounds, == to .equals in java."""
+    lines = code.splitlines(keepends=True)
+    out, seen = [], {code}
+
+    def add(line_no, new_line, what):
+        cand = "".join(lines[:line_no - 1] + [new_line] + lines[line_no:])
+        if cand not in seen and _balanced(cand):
+            seen.add(cand)
+            out.append({"source": cand, "line_no": line_no, "edit": f"line {line_no}: {what}"})
+
+    for line_no in fault_lines:
+        if not 0 < line_no <= len(lines):
+            continue
+        text = lines[line_no - 1]
+        scan = _code_part(text)
+        for m in _SWAP_RE.finditer(scan):
+            # "->" and "::" are member access, not arithmetic
+            if scan[m.end():m.end() + 1] in (">", ":") and m.group(0) == "-":
+                continue
+            for new_tok in _SWAP[m.group(0)]:
+                add(line_no, text[:m.start()] + new_tok + text[m.end():], f"{m.group(0)} -> {new_tok}")
+        for m in re.finditer(r"(?<![\w.])(\w+(?:\.length|\.size\(\))?)(?=\s*[;)\]])", scan):
+            if m.group(1) in ("return", "break", "continue", "null", "true", "false"):
+                continue
+            for delta in ("- 1", "+ 1"):
+                add(line_no, text[:m.start(1)] + f"{m.group(1)} {delta}" + text[m.end(1):],
+                    f"{m.group(1)} -> {m.group(1)} {delta}")
+        if lang == "java":
+            for m in re.finditer(r"([\w.]+(?:\([^()]*\))?)\s*(==|!=)\s*([\w.\"]+(?:\([^()]*\))?)", scan):
+                left, op, right = m.groups()
+                if "null" in (left, right) or right.replace(".", "").isdigit() or left.replace(".", "").isdigit():
+                    continue
+                neg = "!" if op == "!=" else ""
+                add(line_no, text[:m.start()] + f"{neg}{left}.equals({right})" + text[m.end():],
+                    f"{m.group(0)} -> {neg}{left}.equals({right})")
+        if lang == "javascript":
+            for m in re.finditer(r"(?<![=!<>])(==|!=)(?!=)", scan):
+                add(line_no, text[:m.start()] + m.group(1) + "=" + text[m.end():], f"{m.group(1)} -> {m.group(1)}=")
+        if lang in ("c", "cpp"):
+            for m in re.finditer(r"\b(if|while)\s*\(([^=!<>()]*[^=!<>()\s])\s*=\s*([^=)][^)]*)\)", scan):
+                add(line_no, text[:m.start()] + f"{m.group(1)} ({m.group(2).strip()} == {m.group(3).strip()})"
+                    + text[m.end():], "assignment in condition -> comparison")
+            for m in re.finditer(r"\b(\d+)\s*/\s*(\d+)\b", scan):
+                add(line_no, text[:m.start()] + f"{m.group(1)}.0 / {m.group(2)}" + text[m.end():],
+                    f"{m.group(0)} -> floating division")
+    return out[:limit]
+
+
 def make_diff(before, after, name="program.py"):
     return "".join(difflib.unified_diff(
         before.splitlines(keepends=True), after.splitlines(keepends=True),
         fromfile=f"a/{name}", tofile=f"b/{name}", n=2))
 
 
-def _parses(src):
+def _parses(src, lang="python"):
+    if lang != "python":
+        return _balanced(src)
     try:
         ast.parse(src)
         return True
@@ -150,19 +305,21 @@ def mutable_default_fix(code):
     return None
 
 
-def _split_code(source):
+def _split_code(source, lang="python"):
     # code part and trailing remainder. both trees end with description docstrings, and some
     # fixed files also carry alternative solutions inside one. none of that is part of the fix.
     lines = source.splitlines()
-    numbered = code_lines(source)
+    numbered = code_lines(source, lang)
     last = numbered[-1][0] if numbered else len(lines)
     return lines[:last], lines[last:]
 
 
-def ground_truth_patch(program_name, buggy_code):
-    """apply the reference fix from correct_python_programs as hunks, leaving the rest of the buggy file alone."""
-    b, tail = _split_code(buggy_code)
-    c, _ = _split_code(read_correct(program_name))
+def ground_truth_patch(program_name, buggy_code, lang="python"):
+    """apply the reference fix from correct_<lang>_programs as hunks, leaving the rest of the buggy file alone."""
+    b, tail = _split_code(buggy_code, lang)
+    c, _ = _split_code(read_correct(program_name, lang), lang)
+    # the java fixes live in another package, keep the buggy file's own declaration
+    c = [x.replace("package correct_java_programs;", "package java_programs;") for x in c]
     sm = difflib.SequenceMatcher(a=[x.rstrip() for x in b], b=[x.rstrip() for x in c], autojunk=False)
     out = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -170,7 +327,19 @@ def ground_truth_patch(program_name, buggy_code):
     return "\n".join(out + tail) + "\n"
 
 
-PROMPT = """You are fixing a single defect in a Python function.
+LANG_NAMES = {"python": "Python", "java": "Java", "javascript": "JavaScript", "c": "C", "cpp": "C++"}
+LANG_HINTS = {
+    "python": "Watch for off-by-one bounds, wrong comparison operators and mutable default arguments.",
+    "java": "Watch for == on String or boxed objects instead of .equals(), off-by-one loop bounds, ^ used for &, "
+            "null dereferences and List.get index bounds.",
+    "javascript": "Watch for == instead of ===, off-by-one loop bounds over .length, and async callbacks in forEach.",
+    "c": "Watch for = inside if conditions, off-by-one < vs <= bounds, uninitialised variables and integer division.",
+    "cpp": "Watch for = inside if conditions, off-by-one < vs <= bounds, uninitialised variables, integer division "
+           "and new/delete mismatches.",
+}
+
+PROMPT = """You are fixing a single defect in a {lang_name} function.
+{hint}
 
 Fault localization flagged line {fault_line}: `{fault_code}`
 Enclosing function: {function} with arguments {arguments}
@@ -181,11 +350,11 @@ Code around the fault line:
 {snippet}
 
 Full function:
-```python
+```{fence}
 {function_source}
 ```
 
-Return the complete corrected function in one ```python block. Change as little as possible and keep the signature."""
+Return the complete corrected function in one ```{fence} block. Change as little as possible and keep the signature."""
 
 
 def _post_json(url, payload, headers, timeout=60):
@@ -242,16 +411,17 @@ def llm_provider():
 
 
 def _extract_code(reply):
-    blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", reply, flags=re.S)
+    blocks = re.findall(r"```(?:python|py|java|javascript|js|cpp|c\+\+|c)?\s*\n(.*?)```", reply, flags=re.S)
     return (blocks[0] if blocks else reply).strip("\n")
 
 
-def llm_patch(code, ctx, ranked):
+def llm_patch(code, ctx, ranked, lang="python"):
     """returns (patched_source, provider). raises on network or api errors so the caller can log them."""
     for env, name, ask in PROVIDERS:
         if not os.environ.get(env):
             continue
         prompt = PROMPT.format(
+            lang_name=LANG_NAMES[lang], hint=LANG_HINTS[lang], fence="cpp" if lang == "cpp" else lang,
             fault_line=ctx["fault_line"], fault_code=ctx["fault_code"], function=ctx["function"],
             arguments=ctx["arguments"],
             locals=", ".join(f"{a['name']} (line {a['line']})" for a in ctx["local_assignments"]) or "none",
@@ -263,7 +433,7 @@ def llm_patch(code, ctx, ranked):
         if ctx.get("function_span"):
             start, end = ctx["function_span"]
             indent = lines[start - 1][:len(lines[start - 1]) - len(lines[start - 1].lstrip())]
-            body = textwrap.indent(textwrap.dedent(fixed), indent).splitlines()
+            body = (textwrap.indent(textwrap.dedent(fixed), indent) if lang == "python" else fixed).splitlines()
             patched = "\n".join(lines[:start - 1] + body + lines[end:]) + "\n"
         else:
             patched = fixed + "\n"
@@ -286,28 +456,41 @@ def patch_origin(source):
     return "unknown"
 
 
+def can_execute(lang, program_name=None, assert_block=None):
+    """true when this input has tests that can actually run on this machine."""
+    if lang == "python":
+        return bool(program_name) or bool((assert_block or "").strip())
+    return bool((assert_block or "").strip()) and bool(toolchain().get(lang))
+
+
 def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True, use_search=True,
-           allow_ground_truth=True, timeout=3.0, top_k=3):
+           allow_ground_truth=True, timeout=3.0, top_k=3, lang="python"):
     """try llm, then validated single-edit search, then the quixbugs reference fix. first patch that passes wins."""
+    quix = program_name if program_name in list_programs(lang) else None
+    # java quixbugs tests are junit files, so java programs run with user asserts only
+    test_name = quix if lang == "python" else None
     if ranked is None:
-        ranked = rank_lines(code, exclude_program=program_name if program_name in list_programs() else None)
+        ranked = rank_lines(code, exclude_program=quix if lang == "python" else None, lang=lang)
     top = [r["line_no"] for r in ranked[:top_k]]
-    ctx = build_context(code, top[0]) if top else {}
-    can_test = bool(program_name) or bool((assert_block or "").strip())
+    ctx = build_context(code, top[0], lang=lang) if top else {}
+    can_test = can_execute(lang, test_name, assert_block)
     log = []
+    if not can_test and lang != "python":
+        log.append(f"no runnable tests for {lang} here: " + (
+            "add assert lines" if not (assert_block or "").strip() else f"no {lang} compiler or runtime on PATH"))
 
     def passes(src):
-        return run_tests(src, program_name, assert_block, timeout=timeout, fail_fast=True)["passed"]
+        return run_tests(src, test_name, assert_block, timeout=timeout, fail_fast=True, lang=lang)["passed"] is True
 
     def done(patched, source, validated):
-        name = f"{program_name or 'candidate'}.py"
+        name = f"{program_name or 'candidate'}{EXT[lang]}"
         return {"patched": patched, "source": source, "origin": patch_origin(source), "validated": validated,
-                "diff": make_diff(code, patched, name), "context": ctx, "log": log, "fault_lines": top}
+                "diff": make_diff(code, patched, name), "context": ctx, "log": log, "fault_lines": top, "lang": lang}
 
     if use_llm and llm_provider() and top:
         try:
-            patched, provider = llm_patch(code, ctx, ranked)
-            if patched and _parses(patched) and patched != code:
+            patched, provider = llm_patch(code, ctx, ranked, lang)
+            if patched and _parses(patched, lang) and patched != code:
                 if not can_test:
                     log.append(f"{provider}: patch returned, no tests to validate it")
                     return done(patched, f"llm:{provider}", False)
@@ -320,11 +503,14 @@ def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True
         except Exception as exc:
             log.append(f"llm call failed: {type(exc).__name__}: {exc}")
 
-    if use_search and can_test and _parses(code):
-        cands = template_candidates(code, top)
-        fix = mutable_default_fix(code)
-        if fix:
-            cands.insert(0, {"source": fix, "line_no": 0, "edit": "mutable default argument -> None guard"})
+    if use_search and can_test and _parses(code, lang):
+        if lang == "python":
+            cands = template_candidates(code, top)
+            fix = mutable_default_fix(code)
+            if fix:
+                cands.insert(0, {"source": fix, "line_no": 0, "edit": "mutable default argument -> None guard"})
+        else:
+            cands = brace_candidates(code, top, lang)
         with ThreadPoolExecutor(max_workers=6) as pool:
             results = list(pool.map(lambda c: passes(c["source"]), cands))
         log.append(f"single-edit search: {len(cands)} candidates on lines {top}, {sum(results)} pass")
@@ -335,18 +521,19 @@ def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True
             log.append(f"accepted edit: {best['edit']}")
             return done(best["source"], "ast_search", True)
 
-    if allow_ground_truth and program_name in list_programs():
-        log.append("fell back to the reference fix from correct_python_programs")
-        return done(ground_truth_patch(program_name, code), "ground_truth", False)
+    if allow_ground_truth and quix:
+        log.append(f"fell back to the reference fix from correct_{lang}_programs")
+        return done(ground_truth_patch(quix, code, lang), "ground_truth", False)
 
     log.append("no patch found")
     return {"patched": None, "source": None, "origin": "none", "validated": False, "diff": "", "context": ctx,
-            "log": log, "fault_lines": top}
+            "log": log, "fault_lines": top, "lang": lang}
 
 
-def verify_with_pytest(program_name, buggy_code, patched_code, assert_block=None, timeout=3.0):
-    """run the same tests on the original and the patched source, each in its own subprocess."""
+def verify_with_pytest(program_name, buggy_code, patched_code, assert_block=None, timeout=3.0, lang="python"):
+    """run the same tests on the original and the patched source, each in its own sandbox."""
+    test_name = program_name if lang == "python" else None
     with ThreadPoolExecutor(max_workers=2) as pool:
-        before = pool.submit(run_tests, buggy_code, program_name, assert_block, timeout)
-        after = pool.submit(run_tests, patched_code, program_name, assert_block, timeout)
+        before = pool.submit(run_tests, buggy_code, test_name, assert_block, timeout, False, lang)
+        after = pool.submit(run_tests, patched_code, test_name, assert_block, timeout, False, lang)
         return {"before": before.result(), "after": after.result()}
