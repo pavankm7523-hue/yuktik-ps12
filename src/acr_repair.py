@@ -459,13 +459,30 @@ def _store_llm_reply(key, reply):
         tmp.replace(LLM_CACHE_PATH)
 
 
-def llm_patch(code, ctx, ranked, lang="python", use_cache=True):
+FEEDBACK = """
+
+A previous patch for this function was run against the tests and failed. Test output:
+```text
+{output}
+```
+Use this failure to locate the real defect. Do not repeat the previous patch:
+```{fence}
+{previous}
+```"""
+
+MAX_FEEDBACK_CHARS = 1500
+
+
+def llm_patch(code, ctx, ranked, lang="python", use_cache=True, feedback=None, previous=None):
     """returns (patched_source, provider). raises on network or api errors so the caller can log them.
-    raw replies are cached on disk, so a repeat run on the same file and suspects skips the network call."""
+    raw replies are cached on disk, so a repeat run on the same file and suspects skips the network call.
+    feedback is the failing test output of an earlier attempt, used for the second try."""
     for env, name, ask in PROVIDERS:
         if not _api_key(env):
             continue
         key = llm_cache_key(code, ranked, name, lang)
+        if feedback:
+            key += "|retry:" + hashlib.sha1((feedback + (previous or "")).encode("utf-8")).hexdigest()
         reply = _load_llm_cache().get(key) if use_cache else None
         prompt = PROMPT.format(
             lang_name=LANG_NAMES[lang], hint=LANG_HINTS[lang], fence="cpp" if lang == "cpp" else lang,
@@ -475,6 +492,9 @@ def llm_patch(code, ctx, ranked, lang="python", use_cache=True):
             others=", ".join(f"line {r['line_no']}" for r in ranked[1:3]) or "none",
             snippet=ctx["snippet"], function_source=ctx["function_source"] or code,
         )
+        if feedback:
+            prompt += FEEDBACK.format(output=feedback[-MAX_FEEDBACK_CHARS:], previous=(previous or "").strip(),
+                                      fence="cpp" if lang == "cpp" else lang)
         if reply is None:
             reply = ask(prompt)
             _store_llm_reply(key, reply)
@@ -513,63 +533,98 @@ def can_execute(lang, program_name=None, assert_block=None):
     return bool((assert_block or "").strip()) and bool(toolchain().get(lang))
 
 
+def _run_output(run):
+    return ((run.get("stdout") or "") + "\n" + (run.get("stderr") or "")).strip()
+
+
 def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True, use_search=True,
-           allow_ground_truth=True, timeout=3.0, top_k=3, lang="python"):
-    """try llm, then validated single-edit search, then the quixbugs reference fix. first patch that passes wins."""
+           allow_ground_truth=True, timeout=3.0, top_k=3, lang="python", failure_output=None):
+    """llm, then validated single-edit search, each with a second attempt guided by the failing test output,
+    then the quixbugs reference fix. first patch that passes wins."""
     quix = program_name if program_name in list_programs(lang) else None
     # java quixbugs tests are junit files, so java programs run with user asserts only
     test_name = quix if lang == "python" else None
-    if ranked is None:
-        ranked = rank_lines(code, exclude_program=quix if lang == "python" else None, lang=lang)
-    top = [r["line_no"] for r in ranked[:top_k]]
-    ctx = build_context(code, top[0], lang=lang) if top else {}
+    exclude = quix if lang == "python" else None
     can_test = can_execute(lang, test_name, assert_block)
     log = []
     if not can_test and lang != "python":
         log.append(f"no runnable tests for {lang} here: " + (
             "add assert lines" if not (assert_block or "").strip() else f"no {lang} compiler or runtime on PATH"))
 
-    def passes(src):
-        return run_tests(src, test_name, assert_block, timeout=timeout, fail_fast=True, lang=lang)["passed"] is True
+    def run(src):
+        return run_tests(src, test_name, assert_block, timeout=timeout, fail_fast=True, lang=lang)
 
-    def done(patched, source, validated):
+    def passes(src):
+        return run(src)["passed"] is True
+
+    # the failing run of the original program drives the second attempts
+    if failure_output is None and can_test:
+        first = run(code)
+        failure_output = "" if first["passed"] else _run_output(first)
+    if ranked is None:
+        ranked = rank_lines(code, exclude_program=exclude, lang=lang, failure_output=failure_output)
+    top = [r["line_no"] for r in ranked[:top_k]]
+    ctx = build_context(code, top[0], lang=lang) if top else {}
+
+    def done(patched, source, validated, attempt=1):
         name = f"{program_name or 'candidate'}{EXT[lang]}"
         return {"patched": patched, "source": source, "origin": patch_origin(source), "validated": validated,
-                "diff": make_diff(code, patched, name), "context": ctx, "log": log, "fault_lines": top, "lang": lang}
+                "diff": make_diff(code, patched, name), "context": ctx, "log": log, "fault_lines": top,
+                "lang": lang, "attempt": attempt}
 
     if use_llm and llm_provider() and top:
-        try:
-            patched, provider = llm_patch(code, ctx, ranked, lang)
-            if patched and _parses(patched, lang) and patched != code:
-                if not can_test:
-                    log.append(f"{provider}: patch returned, no tests to validate it")
-                    return done(patched, f"llm:{provider}", False)
-                if passes(patched):
-                    log.append(f"{provider}: patch passes the tests")
-                    return done(patched, f"llm:{provider}", True)
-                log.append(f"{provider}: patch did not pass the tests")
-            else:
-                log.append(f"{provider}: reply was not a usable patch")
-        except Exception as exc:
-            log.append(f"llm call failed: {type(exc).__name__}: {exc}")
+        feedback, previous = None, None
+        for attempt in (1, 2):
+            try:
+                patched, provider = llm_patch(code, ctx, ranked, lang, feedback=feedback, previous=previous)
+            except Exception as exc:
+                log.append(f"llm attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                break
+            if not (patched and _parses(patched, lang) and patched != code):
+                log.append(f"{provider} attempt {attempt}: reply was not a usable patch")
+                feedback, previous = failure_output or "the reply was not a usable patch", None
+                continue
+            if not can_test:
+                log.append(f"{provider}: patch returned, no tests to validate it")
+                return done(patched, f"llm:{provider}", False, attempt)
+            result = run(patched)
+            if result["passed"] is True:
+                log.append(f"{provider} attempt {attempt}: patch passes the tests")
+                return done(patched, f"llm:{provider}", True, attempt)
+            feedback, previous = _run_output(result), patched
+            log.append(f"{provider} attempt {attempt}: patch failed the tests"
+                       + (", retrying with the failing output" if attempt == 1 else ""))
 
     if use_search and can_test and _parses(code, lang):
-        if lang == "python":
-            cands = template_candidates(code, top)
-            fix = mutable_default_fix(code)
-            if fix:
-                cands.insert(0, {"source": fix, "line_no": 0, "edit": "mutable default argument -> None guard"})
-        else:
-            cands = brace_candidates(code, top, lang)
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(lambda c: passes(c["source"]), cands))
-        log.append(f"single-edit search: {len(cands)} candidates on lines {top}, {sum(results)} pass")
-        passing = [c for c, ok in zip(cands, results) if ok]
-        if passing:
-            # several edits can satisfy the tests. keep the smallest one.
-            best = min(passing, key=lambda c: len(c["source"]))
-            log.append(f"accepted edit: {best['edit']}")
-            return done(best["source"], "ast_search", True)
+        tried = set()
+        # second search pass: lines named by the failing traceback or matching the exception, wider window
+        retry_ranked = rank_lines(code, exclude_program=exclude, lang=lang, failure_output=failure_output) \
+            if failure_output else ranked
+        passes_lines = [("1", top), ("2", [r["line_no"] for r in retry_ranked[:top_k + 2]])]
+        for attempt, lines in passes_lines:
+            lines = [n for n in lines if n not in tried]
+            if not lines:
+                continue
+            tried.update(lines)
+            if lang == "python":
+                cands = template_candidates(code, lines)
+                fix = mutable_default_fix(code) if attempt == "1" else None
+                if fix:
+                    cands.insert(0, {"source": fix, "line_no": 0, "edit": "mutable default argument -> None guard"})
+            else:
+                cands = brace_candidates(code, lines, lang)
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                results = list(pool.map(lambda c: passes(c["source"]), cands))
+            log.append(f"single-edit search attempt {attempt}: {len(cands)} candidates on lines {lines}, "
+                       f"{sum(results)} pass")
+            passing = [c for c, ok in zip(cands, results) if ok]
+            if passing:
+                # several edits can satisfy the tests. keep the smallest one.
+                best = min(passing, key=lambda c: len(c["source"]))
+                log.append(f"accepted edit: {best['edit']}")
+                return done(best["source"], "ast_search", True, int(attempt))
+            if attempt == "1" and failure_output:
+                log.append("retrying the search on lines from the failing test output")
 
     if allow_ground_truth and quix:
         log.append(f"fell back to the reference fix from correct_{lang}_programs")
@@ -577,7 +632,7 @@ def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True
 
     log.append("no patch found")
     return {"patched": None, "source": None, "origin": "none", "validated": False, "diff": "", "context": ctx,
-            "log": log, "fault_lines": top, "lang": lang}
+            "log": log, "fault_lines": top, "lang": lang, "attempt": None}
 
 
 def verify_with_pytest(program_name, buggy_code, patched_code, assert_block=None, timeout=3.0, lang="python"):

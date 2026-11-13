@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from src import benchmark, train_pipeline
+from src import benchmark, train_pipeline, ui
 from src.acr_repair import DISCOVERED, REFERENCE, build_context, can_execute, llm_provider, repair, verify_with_pytest
 from src.ast_metrics import FEATURE_LABELS, FEATURES
 from src.line_localizer import load_token_model, rank_lines
 from src.quixbugs import faulty_lines, list_programs, program_path, read_buggy, read_correct
-from src.sandbox import _balanced, toolchain
+from src.sandbox import _balanced, run_tests, toolchain
 
 ROOT = Path(__file__).resolve().parent
 MODEL_CHOICES = {"XGBoost (JM1/Halstead)": "xgb", "Random Forest": "rf"}
@@ -131,15 +131,43 @@ def retrain():
     return proc
 
 
-def run_block(title, run):
-    if run["passed"] is None:
-        status = "NOT RUN (static check only)"
-    else:
-        status = "PASS" if run["passed"] else ("TIMEOUT" if run["timed_out"] else "FAIL")
-    st.markdown(f"**{title}: {status}**")
-    st.caption(f"exit code {run['exit_code']}, {run['runtime_ms']:.0f} ms, {run['command']}")
-    st.code((run["stdout"] + run["stderr"]).strip() or "(no output)", language="text")
+@st.cache_data(max_entries=128, show_spinner=False)
+def first_run(code, program, tests, timeout, lang):
+    """the failing run of the input as it is. its output guides localization and fills the status card."""
+    return run_tests(code, program, tests, timeout=timeout, fail_fast=True, lang=lang)
 
+
+# judge test cases for custom input mode: (python source, asserts)
+QUICK_LOADS = {
+    "Off-by-One Loop": SAMPLES["python"],
+    "Mutable Default Arg": ('''def append_item(item, bucket=[]):
+    bucket.append(item)
+    return bucket
+''', '''assert append_item(1) == [1]
+assert append_item(2) == [2]
+assert append_item(3, [0]) == [0, 3]
+'''),
+    "Infinite Loop Timeout Test": ('''def count_set_bits(n):
+    count = 0
+    while n:
+        n ^= n - 1
+        count += 1
+    return count
+''', '''assert count_set_bits(5) == 2
+assert count_set_bits(8) == 1
+assert count_set_bits(0) == 0
+'''),
+}
+
+
+def quick_load(name):
+    source, asserts = QUICK_LOADS[name]
+    st.session_state["lang_select"] = "Python"
+    st.session_state["code_python"] = source
+    st.session_state["tests_python"] = asserts
+
+
+st.markdown(ui.CSS, unsafe_allow_html=True)
 
 st.sidebar.header("Input")
 mode = st.sidebar.radio("Source", ["QuixBugs program", "Custom Input"])
@@ -152,7 +180,7 @@ if mode == "QuixBugs program":
     code = read_buggy(program, lang)
     st.sidebar.caption(str(program_path(program, lang).relative_to(ROOT)))
 else:
-    lang = LANGS[st.sidebar.selectbox("Language", list(LANGS))]
+    lang = LANGS[st.sidebar.selectbox("Language", list(LANGS), key="lang_select")]
     code = None
 
 model_label = st.sidebar.selectbox("Classifier", list(MODEL_CHOICES))
@@ -176,10 +204,15 @@ st.title("Defect prediction, bug localization and program repair")
 if mode == "Custom Input":
     sample_code, sample_tests = SAMPLES[lang]
     label = next(k for k, v in LANGS.items() if v == lang)
+    st.caption("Quick-load a Python test case:")
+    for col, name in zip(st.columns(len(QUICK_LOADS) + 2), QUICK_LOADS):
+        col.button(name, on_click=quick_load, args=(name,), width="stretch")
     left, right = st.columns(2)
     # keyed per language so switching the selector loads that language's template
-    code = left.text_area(f"{label} source", sample_code, height=260, key=f"code_{lang}")
-    tests = right.text_area("Assert tests (one per line)", sample_tests, height=260, key=f"tests_{lang}")
+    st.session_state.setdefault(f"code_{lang}", sample_code)
+    st.session_state.setdefault(f"tests_{lang}", sample_tests)
+    code = left.text_area(f"{label} source", height=260, key=f"code_{lang}")
+    tests = right.text_area("Assert tests (one per line)", height=260, key=f"tests_{lang}")
 
 if not train_pipeline.METRICS_PATH.exists():
     st.warning("No trained models found. Use the sidebar button or run: python -m src.train_pipeline")
@@ -197,8 +230,39 @@ elif not _balanced(code):
 
 stamp = model_stamp()
 metrics = train_pipeline.load_metrics()
-ranked = rank_lines(code, model=get_token_model(stamp), exclude_program=program if lang == "python" else None,
-                    lang=lang)
+test_program = program if lang == "python" else None
+can_test = can_execute(lang, test_program, tests)
+baseline = first_run(code, test_program, tests, timeout, lang) if can_test else None
+failure = None
+if baseline and not baseline["passed"]:
+    failure = baseline["stdout"] + "\n" + baseline["stderr"]
+ranked = rank_lines(code, model=get_token_model(stamp), exclude_program=test_program, lang=lang,
+                    failure_output=failure)
+info = get_explanation(code, model_kind, lang, stamp)
+
+if baseline is None:
+    test_card = {"label": "Tests on input", "value": "n/a", "pill": "NOT RUN", "tone": "slate",
+                 "sub": "no runnable tests"}
+else:
+    status, tone = ui.run_status(baseline)
+    test_card = {"label": "Tests on input", "value": status, "sub": f"{baseline['runtime_ms']:.0f} ms",
+                 "pill": "DEFECT CONFIRMED" if tone == "fail" else "NO FAILURE",
+                 "tone": "red" if tone == "fail" else "green"}
+prob = info["probability"]
+suspect = ranked[0] if ranked else None
+st.markdown(ui.kpi_strip([
+    {"label": "Defect probability", "value": f"{prob:.3f}", "sub": model_label,
+     "pill": "HIGH" if prob >= 0.7 else ("MEDIUM" if prob >= 0.4 else "LOW"),
+     "tone": "red" if prob >= 0.7 else ("amber" if prob >= 0.4 else "green")},
+    {"label": "Top suspect line", "value": f"L{suspect['line_no']}" if suspect else "n/a",
+     "sub": f"score {suspect['suspicion_score']:.3f}" if suspect else "",
+     "pill": "TRACEBACK GUIDED" if failure else "STATIC SIGNALS", "tone": "amber" if failure else "slate"},
+    test_card,
+    {"label": "Input", "value": program or "custom", "sub": f"{len(code.splitlines())} lines",
+     "pill": lang.upper(), "tone": "slate"},
+    {"label": "Repair backend", "value": provider or "search", "sub": "llm then single-edit search",
+     "pill": "LLM ON" if provider else "NO API KEY", "tone": "green" if provider else "slate"},
+]), unsafe_allow_html=True)
 
 tab_pred, tab_loc, tab_fix, tab_bench = st.tabs([
     "Defect Prediction & SHAP",
@@ -208,7 +272,6 @@ tab_pred, tab_loc, tab_fix, tab_bench = st.tabs([
 ])
 
 with tab_pred:
-    info = get_explanation(code, model_kind, lang, stamp)
     if lang != "python":
         st.info("The classifiers were trained on Python AST metrics. For this language the same 29 columns come from "
                 "a lexical extractor (Halstead tokens, McCabe branch keywords, brace depth), so the probability is "
@@ -284,6 +347,12 @@ with tab_loc:
                        + ("Token weights were refitted without this program before scoring it." if lang == "python"
                           else "Token weights come from the Python programs; the Java rules add the language signals."))
 
+        if failure:
+            st.caption("The failing test run boosted lines named in the traceback and lines matching the "
+                       "exception type. Hover a line to see its signals.")
+        st.subheader("Suspicion heatmap")
+        st.markdown(ui.heatmap(code, ranked), unsafe_allow_html=True)
+
         st.subheader("Per-line suspicion")
         by_line = frame.sort_values("line_no")[
             ["line_no", "code", "suspicion_score", "token_score", "ast_score", "ast_node_type", "signals"]]
@@ -299,7 +368,6 @@ with tab_loc:
         st.code(ctx.get("snippet", ""), language="text")
 
 with tab_fix:
-    can_test = can_execute(lang, program if lang == "python" else None, tests)
     if not can_test and lang != "python":
         st.info(f"No runnable tests for {lang} on this machine "
                 + ("(add assert lines)." if not (tests or "").strip() else "(compiler or runtime not on PATH).")
@@ -308,7 +376,7 @@ with tab_fix:
     if st.button("Generate patch and run pytest"):
         with st.spinner("searching for a patch"):
             fix = repair(code, program_name=program, assert_block=tests, ranked=ranked, use_llm=use_llm,
-                         timeout=timeout, lang=lang)
+                         timeout=timeout, lang=lang, failure_output=failure)
         st.session_state["fix"] = (code, fix)
         if fix["patched"]:
             with st.spinner("running the tests on both versions"):
@@ -334,7 +402,7 @@ with tab_fix:
                 st.info(f"DISCOVERED by {fix['source']}, but there were no tests to validate it.")
             st.caption(f"Suspect lines sent to repair: {fix['fault_lines']}.")
             st.subheader("Unified diff")
-            st.code(fix["diff"] or "(no textual change)", language="diff")
+            st.markdown(ui.diff_view(fix["diff"]), unsafe_allow_html=True)
             a, b = st.columns(2)
             a.subheader("Original")
             a.code(code, language=HIGHLIGHT[lang], line_numbers=True)
@@ -347,13 +415,11 @@ with tab_fix:
                 st.info("No tests available for this input, so the patch was not executed.")
             else:
                 a, b = st.columns(2)
-                with a:
-                    run_block("Original", runs["before"])
-                with b:
-                    run_block("Patched", runs["after"])
+                a.markdown(ui.terminal_card("Original", runs["before"]), unsafe_allow_html=True)
+                b.markdown(ui.terminal_card("Patched", runs["after"]), unsafe_allow_html=True)
     else:
-        st.info("Patch generation order: LLM (if a key is set), validated single-edit AST search, "
-                "then the QuixBugs reference fix as a fallback. A fallback is labelled as such and is not a repair.")
+        st.info("Patch generation order: LLM (if a key is set), validated single-edit AST search, each retried once "
+                "with the failing test output, then the QuixBugs reference fix as a fallback. A fallback is labelled as such and is not a repair.")
 
 with tab_bench:
     bench_lang = lang if lang in ("python", "java") else "python"

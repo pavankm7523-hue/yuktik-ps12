@@ -192,8 +192,45 @@ def _brace_owner(text):
     return "Assign" if re.search(r"[^=!<>]=[^=]", s) else "Expr"
 
 
-def rank_lines(code, model=None, exclude_program=None, lang="python"):
-    """rank code lines by suspicion. pass exclude_program to score a quixbugs file without having trained on it."""
+# autocoderover style: the failing run says where to look. exception type -> ast signals it points at.
+_EXC_SIGNALS = {
+    "IndexError": ("index_subscript", "slice", "off_by_one", "range_bound"),
+    "KeyError": ("index_subscript",),
+    "RecursionError": ("recursive_call", "branch_condition", "return_value"),
+    "timeout": ("loop_condition", "recursive_call", "branch_condition", "aug_assign", "off_by_one"),
+    "ZeroDivisionError": ("division",),
+    "AssertionError": ("return_value", "aug_assign", "off_by_one", "boundary_compare"),
+    "TypeError": ("return_value", "recursive_call"),
+}
+W_FRAME = 0.3
+W_EXC = 0.15
+_FRAME = re.compile(r'File "([^"]+)", line (\d+)')
+_EXC = re.compile(r"^\s*(?:[\w.]+\.)?(\w+(?:Error|Exception))\b", re.M)
+_HARNESS = ("test_", "load_testdata", "_fast_worker", "pytest", "conftest")
+
+
+def failure_hints(failure_output):
+    """(candidate line numbers named in the traceback, exception kinds raised) from a failing run's output."""
+    text = failure_output or ""
+    lines = set()
+    for path, no in _FRAME.findall(text):
+        base = re.split(r"[\\/]", path)[-1]
+        low = path.lower()
+        # keep frames from the program under test, drop the harness and the standard library
+        if base.startswith(_HARNESS) or "site-packages" in low or "\\lib\\" in low or "/lib/" in low or base.startswith("<"):
+            continue
+        lines.add(int(no))
+    kinds = set(_EXC.findall(text)) & set(_EXC_SIGNALS)
+    if "killed after" in text or "timed out" in text or "maximum recursion depth" in text:
+        kinds.add("timeout" if "killed after" in text or "timed out" in text else "RecursionError")
+    return lines, kinds
+
+
+def rank_lines(code, model=None, exclude_program=None, lang="python", failure_output=None):
+    """rank code lines by suspicion. pass exclude_program to score a quixbugs file without having trained on it.
+    failure_output from a failing test run boosts traceback lines and lines matching the exception type."""
+    frame_lines, kinds = failure_hints(failure_output)
+    wanted = {s for k in kinds for s in _EXC_SIGNALS[k]}
     if exclude_program and lang == "python":
         model = fit_token_model(exclude=exclude_program)
     model = model or load_token_model()
@@ -214,6 +251,16 @@ def rank_lines(code, model=None, exclude_program=None, lang="python"):
         ast_part = 1.0 - float(np.prod([1.0 - w for w in sig.values()])) if sig else 0.0
         tok_part = token_score(text if lang == "python" else preprocess_line(text, lang), model)
         score = W_TOKEN * tok_part + W_AST * ast_part
+        hints = []
+        if no in frame_lines:
+            score += W_FRAME
+            hints.append("traceback_frame")
+        matched = sorted(wanted & set(sig))
+        if matched:
+            score += W_EXC
+            hints.append("exception:" + "/".join(matched))
+        if hints:
+            sig = dict(sig, **{h: 0.0 for h in hints})
         rows.append({
             "line_no": no,
             "code": text.rstrip(),

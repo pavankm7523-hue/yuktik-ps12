@@ -8,12 +8,13 @@ import pandas as pd
 
 from src.acr_repair import DISCOVERED, REFERENCE, can_execute, llm_provider, repair, verify_with_pytest
 from src.line_localizer import load_token_model, rank_lines
+from src.sandbox import run_tests
 from src.quixbugs import DATA_DIR, faulty_lines, list_programs, read_buggy, read_correct
 
 CACHE_PATH = DATA_DIR / "benchmark_cache.json"
 WORKERS = 6
 # bump when the row layout or the repair logic changes, old cache entries are then ignored
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 _lock = threading.Lock()
 
@@ -47,13 +48,19 @@ def evaluate_program(name, use_llm=False, use_search=True, timeout=3.0, lang="py
     buggy = read_buggy(name, lang)
     truth = set(faulty_lines(buggy, read_correct(name, lang), lang))
     # leave-one-out: the token model never sees the program it is scored on (it is trained on python only)
+    # the failing run of the buggy program feeds traceback-guided localization, as autocoderover does
+    failure = None
+    if can_execute(lang, name):
+        first = run_tests(buggy, name, timeout=timeout, fail_fast=True, lang=lang)
+        failure = "" if first["passed"] else (first["stdout"] + "\n" + first["stderr"])
     ranked = rank_lines(buggy, exclude_program=name if lang == "python" else None,
-                        model=None if lang == "python" else load_token_model(), lang=lang)
+                        model=None if lang == "python" else load_token_model(), lang=lang,
+                        failure_output=failure)
     order = [r["line_no"] for r in ranked]
     first_hit = next((i for i, no in enumerate(order, start=1) if no in truth), None)
 
     fix = repair(buggy, program_name=name, ranked=ranked, use_llm=use_llm, use_search=use_search,
-                 timeout=timeout, lang=lang)
+                 timeout=timeout, lang=lang, failure_output=failure)
     if can_execute(lang, name):
         runs = verify_with_pytest(name, buggy, fix["patched"], timeout=timeout, lang=lang)
         before, after = runs["before"], runs["after"]
