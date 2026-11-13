@@ -99,7 +99,9 @@ assert(findMax({4}) == 4);
 }
 
 
-st.set_page_config(page_title="PS12 code intelligence", layout="wide")
+LOGO = ROOT / "assets" / "sentinalx_logo.webp"
+
+st.set_page_config(page_title="SentinalX", layout="wide")
 
 
 @st.cache_resource
@@ -276,7 +278,11 @@ st.sidebar.text(f"LLM: {provider}" if provider else "LLM: none (no API key in en
 st.sidebar.text("python: fast worker pool\n" + "\n".join(
     f"{k}: {'found' if v else 'not on PATH, static check only'}" for k, v in toolchain().items()))
 
-st.title("Defect prediction, bug localization and program repair")
+if LOGO.exists():
+    st.image(str(LOGO), width=520)
+else:
+    st.title("SentinalX")
+st.caption("SentinalX: defect prediction, bug localization and program repair")
 
 if mode == "Custom Input":
     sample_code, sample_tests = SAMPLES[lang]
