@@ -307,6 +307,66 @@ def mutable_default_fix(code):
     return None
 
 
+def _touched_names(body):
+    """names a loop body may change: assignment targets, plus anything a call could mutate in place."""
+    names = set()
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.add(node.id)
+            elif isinstance(node, ast.Call):
+                # q.pop() or heappop(q) can change q without an assignment
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name):
+                        names.add(sub.id)
+            elif isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                for sub in ast.walk(node.value):
+                    if isinstance(sub, ast.Name):
+                        names.add(sub.id)
+    return names
+
+
+def stalled_loop_fixes(code):
+    """a while loop whose condition only reads names the body never changes, and that has no break, return or
+    raise, can never end once entered. propose the missing step: one line appended to the loop body."""
+    tree = ast.parse(code)
+    lines = code.splitlines(keepends=True)
+    out = []
+    for loop in ast.walk(tree):
+        if not isinstance(loop, ast.While) or loop.body[0].lineno == loop.lineno:
+            continue
+        if any(isinstance(n, (ast.Break, ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.Await))
+               for stmt in loop.body for n in ast.walk(stmt)):
+            continue
+        if any(isinstance(n, (ast.Call, ast.NamedExpr)) for n in ast.walk(loop.test)):
+            continue
+        cond_names = [n.id for n in ast.walk(loop.test) if isinstance(n, ast.Name)]
+        if not cond_names or set(cond_names) & _touched_names(loop.body):
+            continue
+        # the comparison says which way the variable has to move for the condition to turn false
+        steps = []
+        test = loop.test
+        if isinstance(test, ast.Compare) and len(test.ops) == 1:
+            left, op, right = test.left, test.ops[0], test.comparators[0]
+            down, up = (ast.Gt, ast.GtE), (ast.Lt, ast.LtE)
+            if isinstance(left, ast.Name):
+                steps += [(left.id, "-=")] if isinstance(op, down) else [(left.id, "+=")] if isinstance(op, up) else []
+            if isinstance(right, ast.Name):
+                steps += [(right.id, "+=")] if isinstance(op, down) else [(right.id, "-=")] if isinstance(op, up) else []
+        for name in dict.fromkeys(cond_names):
+            steps += [(name, "-="), (name, "+=")]
+        indent = " " * loop.body[0].col_offset
+        end = loop.body[-1].end_lineno
+        if not lines[end - 1].endswith("\n"):
+            lines[end - 1] += "\n"
+        for name, op in dict.fromkeys(steps):
+            step = f"{name} {op} 1"
+            cand = "".join(lines[:end]) + f"{indent}{step}\n" + "".join(lines[end:])
+            out.append({"source": cand, "line_no": loop.lineno,
+                        "edit": f"while loop on line {loop.lineno} never changes {name}: add '{step}' to its body"})
+    return out
+
+
 def _split_code(source, lang="python"):
     # code part and trailing remainder. both trees end with description docstrings, and some
     # fixed files also carry alternative solutions inside one. none of that is part of the fix.
@@ -611,6 +671,9 @@ def repair(code, program_name=None, assert_block=None, ranked=None, use_llm=True
                 fix = mutable_default_fix(code) if attempt == "1" else None
                 if fix:
                     cands.insert(0, {"source": fix, "line_no": 0, "edit": "mutable default argument -> None guard"})
+                if attempt == "1":
+                    # a loop that can never end is a whole-file finding, like the mutable default, not a line edit
+                    cands = stalled_loop_fixes(code) + cands
             else:
                 cands = brace_candidates(code, lines, lang)
             with ThreadPoolExecutor(max_workers=6) as pool:
