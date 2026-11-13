@@ -1,0 +1,13 @@
+.venv/
+.sandbox/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+*.log
+/build/
+/dist/
+vendor/auto-code-rover/results/
+vendor/DeepLineDP/script/line-level-baseline/
+data/variant_test_cache.json

@@ -1,0 +1,246 @@
+{
+  "training_data": "data/quixbugs_jm1_features.csv",
+  "split": "fold 1 of 5, stratified by label and grouped by program",
+  "rows": 318,
+  "train_rows": 254,
+  "test_rows": 64,
+  "final_training_rows": 318,
+  "final_training_programs": 40,
+  "cv_folds": 5,
+  "test_programs": [
+    "breadth_first_search",
+    "lis",
+    "max_sublist_sum",
+    "next_palindrome",
+    "reverse_linked_list",
+    "shunting_yard",
+    "sqrt",
+    "wrap"
+  ],
+  "defective_rows": 194,
+  "variants": {
+    "mutant": 154,
+    "refactor": 84,
+    "quixbugs_buggy": 40,
+    "quixbugs_correct": 40
+  },
+  "features": [
+    "loc",
+    "v(g)",
+    "ev(g)",
+    "iv(g)",
+    "n",
+    "v",
+    "l",
+    "d",
+    "i",
+    "e",
+    "b",
+    "t",
+    "lOCode",
+    "uniq_Op",
+    "uniq_Opnd",
+    "total_Op",
+    "total_Opnd",
+    "branchCount",
+    "max_nesting",
+    "ast_depth",
+    "ast_nodes",
+    "loops",
+    "conditionals",
+    "compares",
+    "subscripts",
+    "calls",
+    "returns",
+    "bool_ops",
+    "aug_assigns"
+  ],
+  "models": {
+    "xgb": {
+      "rows": 64,
+      "accuracy": 0.59375,
+      "precision": 0.6590909090909091,
+      "recall": 0.725,
+      "f1": 0.6904761904761905,
+      "roc_auc": 0.5026041666666667,
+      "confusion_matrix": [
+        [
+          9,
+          15
+        ],
+        [
+          11,
+          29
+        ]
+      ],
+      "original_pairs": {
+        "rows": 16,
+        "accuracy": 0.5,
+        "precision": 0.5,
+        "recall": 0.75,
+        "f1": 0.6,
+        "roc_auc": 0.359375,
+        "confusion_matrix": [
+          [
+            2,
+            6
+          ],
+          [
+            2,
+            6
+          ]
+        ]
+      },
+      "generated_variants": {
+        "rows": 48,
+        "accuracy": 0.625,
+        "precision": 0.71875,
+        "recall": 0.71875,
+        "f1": 0.71875,
+        "roc_auc": 0.525390625,
+        "confusion_matrix": [
+          [
+            7,
+            9
+          ],
+          [
+            9,
+            23
+          ]
+        ]
+      },
+      "group_cv": {
+        "rows": 318,
+        "accuracy": 0.610062893081761,
+        "precision": 0.65625,
+        "recall": 0.7577319587628866,
+        "f1": 0.7033492822966507,
+        "roc_auc": 0.59694047223146,
+        "confusion_matrix": [
+          [
+            47,
+            77
+          ],
+          [
+            47,
+            147
+          ]
+        ],
+        "folds": 5
+      },
+      "cv_roc_auc_mean": 0.6046779970760234,
+      "cv_roc_auc_std": 0.06203667490484595,
+      "jm1_baseline": {
+        "rows": 64,
+        "accuracy": 0.375,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "roc_auc": 0.37500000000000006,
+        "confusion_matrix": [
+          [
+            24,
+            0
+          ],
+          [
+            40,
+            0
+          ]
+        ]
+      }
+    },
+    "rf": {
+      "rows": 64,
+      "accuracy": 0.59375,
+      "precision": 0.6521739130434783,
+      "recall": 0.75,
+      "f1": 0.6976744186046512,
+      "roc_auc": 0.5151041666666667,
+      "confusion_matrix": [
+        [
+          8,
+          16
+        ],
+        [
+          10,
+          30
+        ]
+      ],
+      "original_pairs": {
+        "rows": 16,
+        "accuracy": 0.5,
+        "precision": 0.5,
+        "recall": 0.75,
+        "f1": 0.6,
+        "roc_auc": 0.421875,
+        "confusion_matrix": [
+          [
+            2,
+            6
+          ],
+          [
+            2,
+            6
+          ]
+        ]
+      },
+      "generated_variants": {
+        "rows": 48,
+        "accuracy": 0.625,
+        "precision": 0.7058823529411765,
+        "recall": 0.75,
+        "f1": 0.7272727272727273,
+        "roc_auc": 0.548828125,
+        "confusion_matrix": [
+          [
+            6,
+            10
+          ],
+          [
+            8,
+            24
+          ]
+        ]
+      },
+      "group_cv": {
+        "rows": 318,
+        "accuracy": 0.5943396226415094,
+        "precision": 0.6511627906976745,
+        "recall": 0.7216494845360825,
+        "f1": 0.684596577017115,
+        "roc_auc": 0.5876496508147655,
+        "confusion_matrix": [
+          [
+            49,
+            75
+          ],
+          [
+            54,
+            140
+          ]
+        ],
+        "folds": 5
+      },
+      "cv_roc_auc_mean": 0.5969340886939573,
+      "cv_roc_auc_std": 0.05870615644399254,
+      "jm1_baseline": {
+        "rows": 64,
+        "accuracy": 0.375,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "roc_auc": 0.3578125,
+        "confusion_matrix": [
+          [
+            24,
+            0
+          ],
+          [
+            40,
+            0
+          ]
+        ]
+      }
+    }
+  }
+}
