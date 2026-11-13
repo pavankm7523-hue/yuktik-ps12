@@ -11,3 +11,5 @@ __pycache__/
 vendor/auto-code-rover/results/
 vendor/DeepLineDP/script/line-level-baseline/
 data/variant_test_cache.json
+.vercel
+.env
