@@ -224,14 +224,6 @@ def run_block(col, title, run):
     col.code((run["stdout"] + run["stderr"]).strip() or "(no output)", language="text")
 
 
-# the theme lives in .streamlit/config.toml. this only tightens the top padding and the tab labels.
-st.markdown("""<style>
-.block-container { padding-top: 1.5rem; }
-.stTabs [data-baseweb="tab-list"] { gap: 1.5rem; }
-.stTabs [data-baseweb="tab"] { padding: 0.5rem 0; }
-.stTabs [data-baseweb="tab"] p { font-size: 0.95rem; font-weight: 600; }
-</style>""", unsafe_allow_html=True)
-
 st.sidebar.header("Input")
 mode = st.sidebar.radio("Source", ["QuixBugs program", "Custom Input"])
 program = None
