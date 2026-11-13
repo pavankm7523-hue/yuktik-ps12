@@ -1,17 +1,19 @@
 ﻿import ast
 import difflib
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import textwrap
+import threading
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from src import mutations
 from src.line_localizer import rank_lines
-from src.quixbugs import EXT, SANDBOX_DIR, VENDOR, code_lines, list_programs, read_correct
+from src.quixbugs import DATA_DIR, EXT, SANDBOX_DIR, VENDOR, code_lines, list_programs, read_correct
 from src.sandbox import _balanced, run_tests, toolchain
 
 ACR_SEARCH_UTILS = VENDOR / "auto-code-rover" / "app" / "search" / "search_utils.py"
@@ -379,8 +381,10 @@ def _api_key(name):
 def _ask_gemini(prompt):
     model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    data = _post_json(url, {"contents": [{"parts": [{"text": prompt}]}]},
-                      {"x-goog-api-key": _api_key("GEMINI_API_KEY")})
+    # deterministic and short: a one-function patch, so repeat runs give the same answer
+    payload = {"contents": [{"parts": [{"text": prompt}]}],
+               "generationConfig": {"temperature": 0.0, "maxOutputTokens": GEMINI_MAX_TOKENS}}
+    data = _post_json(url, payload, {"x-goog-api-key": _api_key("GEMINI_API_KEY")})
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
@@ -427,11 +431,42 @@ def _extract_code(reply):
     return (blocks[0] if blocks else reply).strip("\n")
 
 
-def llm_patch(code, ctx, ranked, lang="python"):
-    """returns (patched_source, provider). raises on network or api errors so the caller can log them."""
+LLM_CACHE_PATH = DATA_DIR / "llm_repair_cache.json"
+GEMINI_MAX_TOKENS = 256
+_llm_lock = threading.Lock()
+
+
+def llm_cache_key(code, ranked, provider, lang="python"):
+    """file sha1 plus the top-3 suspect lines. provider and language keep different backends apart."""
+    top3 = ",".join(str(r["line_no"]) for r in ranked[:3])
+    return "|".join([hashlib.sha1(code.encode("utf-8")).hexdigest(), top3, provider, lang])
+
+
+def _load_llm_cache():
+    try:
+        return json.loads(LLM_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _store_llm_reply(key, reply):
+    with _llm_lock:
+        cache = _load_llm_cache()
+        cache[key] = reply
+        LLM_CACHE_PATH.parent.mkdir(exist_ok=True)
+        tmp = LLM_CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
+        tmp.replace(LLM_CACHE_PATH)
+
+
+def llm_patch(code, ctx, ranked, lang="python", use_cache=True):
+    """returns (patched_source, provider). raises on network or api errors so the caller can log them.
+    raw replies are cached on disk, so a repeat run on the same file and suspects skips the network call."""
     for env, name, ask in PROVIDERS:
         if not _api_key(env):
             continue
+        key = llm_cache_key(code, ranked, name, lang)
+        reply = _load_llm_cache().get(key) if use_cache else None
         prompt = PROMPT.format(
             lang_name=LANG_NAMES[lang], hint=LANG_HINTS[lang], fence="cpp" if lang == "cpp" else lang,
             fault_line=ctx["fault_line"], fault_code=ctx["fault_code"], function=ctx["function"],
@@ -440,7 +475,10 @@ def llm_patch(code, ctx, ranked, lang="python"):
             others=", ".join(f"line {r['line_no']}" for r in ranked[1:3]) or "none",
             snippet=ctx["snippet"], function_source=ctx["function_source"] or code,
         )
-        fixed = _extract_code(ask(prompt))
+        if reply is None:
+            reply = ask(prompt)
+            _store_llm_reply(key, reply)
+        fixed = _extract_code(reply)
         lines = code.splitlines()
         if ctx.get("function_span"):
             start, end = ctx["function_span"]

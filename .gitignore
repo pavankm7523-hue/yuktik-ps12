@@ -18,3 +18,4 @@ data/variant_test_cache.json
 *.tmp
 *.zip
 .sandbox_*/
+data/llm_repair_cache.json

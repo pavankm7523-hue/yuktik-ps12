@@ -238,14 +238,19 @@ def _positive_class_shap(explainer, X):
     return values[0], float(base[-1])
 
 
-def explain_file(code_str, model_type="xgb", model=None, lang="python"):
+def make_explainer(model):
     import shap
 
+    return shap.TreeExplainer(model)
+
+
+def explain_file(code_str, model_type="xgb", model=None, lang="python", explainer=None):
+    """pass a prebuilt explainer to skip rebuilding the tree explainer on every call."""
     model = model or load_model(model_type)
     feats = extract_jm1_metrics(code_str, lang)
     X = pd.DataFrame([feats], columns=FEATURES).astype(float)
     proba = float(model.predict_proba(X)[0, 1])
-    values, base = _positive_class_shap(shap.TreeExplainer(model), X)
+    values, base = _positive_class_shap(explainer or make_explainer(model), X)
     return {
         "probability": proba,
         "features": feats,

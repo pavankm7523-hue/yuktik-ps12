@@ -103,6 +103,18 @@ def get_model(kind, stamp):
 
 
 @st.cache_resource
+def get_explainer(kind, stamp):
+    # building a tree explainer walks every tree, so it is built once per model file
+    return train_pipeline.make_explainer(get_model(kind, stamp))
+
+
+@st.cache_data(max_entries=256, show_spinner=False)
+def get_explanation(code, kind, lang, stamp):
+    return train_pipeline.explain_file(code, kind, model=get_model(kind, stamp), lang=lang,
+                                       explainer=get_explainer(kind, stamp))
+
+
+@st.cache_resource
 def get_token_model(stamp):
     return load_token_model()
 
@@ -115,6 +127,7 @@ def model_stamp():
 def retrain():
     proc = subprocess.run([sys.executable, "-m", "src.train_pipeline"], cwd=ROOT, capture_output=True, text=True)
     st.cache_resource.clear()
+    st.cache_data.clear()
     return proc
 
 
@@ -195,7 +208,7 @@ tab_pred, tab_loc, tab_fix, tab_bench = st.tabs([
 ])
 
 with tab_pred:
-    info = train_pipeline.explain_file(code, model_kind, model=get_model(model_kind, stamp), lang=lang)
+    info = get_explanation(code, model_kind, lang, stamp)
     if lang != "python":
         st.info("The classifiers were trained on Python AST metrics. For this language the same 29 columns come from "
                 "a lexical extractor (Halstead tokens, McCabe branch keywords, brace depth), so the probability is "
