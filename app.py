@@ -224,6 +224,28 @@ def run_block(col, title, run):
     col.code((run["stdout"] + run["stderr"]).strip() or "(no output)", language="text")
 
 
+# light is the palette in .streamlit/config.toml. the button swaps streamlit's own theme options, no css involved.
+PALETTES = {
+    "light": {"base": "light", "primaryColor": "#ea580c", "backgroundColor": "#ffffff",
+              "secondaryBackgroundColor": "#f4f4f5", "textColor": "#111111"},
+    "dark": {"base": "dark", "primaryColor": "#f97316", "backgroundColor": "#0b0f17",
+             "secondaryBackgroundColor": "#111827", "textColor": "#f8fafc"},
+}
+
+
+def toggle_theme():
+    st.session_state["theme_mode"] = "light" if st.session_state.get("theme_mode") == "dark" else "dark"
+
+
+theme_mode = st.session_state.setdefault("theme_mode", "light")
+palette = PALETTES[theme_mode]
+if any(st.get_option(f"theme.{k}") != v for k, v in palette.items()):
+    for k, v in palette.items():
+        st.config.set_option(f"theme.{k}", v)
+    st.rerun()
+st.sidebar.button("Switch to light mode" if theme_mode == "dark" else "Switch to dark mode",
+                  key="theme_toggle", on_click=toggle_theme, width="stretch")
+
 st.sidebar.header("Input")
 mode = st.sidebar.radio("Source", ["QuixBugs program", "Custom Input"])
 program = None
@@ -363,10 +385,14 @@ with tab_pred:
     with right:
         st.subheader("SHAP attribution")
         shap_s = pd.Series(info["shap"]).sort_values(key=abs)
-        fig, ax = plt.subplots(figsize=(7, 7.5), facecolor="white")
-        ax.set_facecolor("white")
-        ax.barh(shap_s.index, shap_s.values, color="#EA580C")
-        ax.axvline(0, color="#18181B", linewidth=0.8)
+        fig, ax = plt.subplots(figsize=(7, 7.5), facecolor=palette["backgroundColor"])
+        ax.set_facecolor(palette["backgroundColor"])
+        ax.barh(shap_s.index, shap_s.values, color=palette["primaryColor"])
+        ax.axvline(0, color=palette["textColor"], linewidth=0.8)
+        ax.tick_params(colors=palette["textColor"])
+        ax.xaxis.label.set_color(palette["textColor"])
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(palette["textColor"])
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.set_xlabel(f"SHAP value ({info['shap_units']}), positive pushes towards defective")
@@ -562,7 +588,8 @@ with tab_bench:
         st.dataframe(benchmark.summarize_origins(df), hide_index=True, width="stretch")
 
         def shade(row):
-            colour = {DISCOVERED: "background-color: #d9ead3", REFERENCE: "background-color: #fff2cc"}
+            colour = {DISCOVERED: "background-color: #d9ead3; color: #111111",
+                      REFERENCE: "background-color: #fff2cc; color: #111111"}
             return [colour.get(row["patch_origin"], "") if col in ("patch_origin", "repair_source") else ""
                     for col in row.index]
 
