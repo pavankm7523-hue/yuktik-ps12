@@ -99,7 +99,8 @@ assert(findMax({4}) == 4);
 }
 
 
-LOGO = ROOT / "assets" / "sentinalx_logo.webp"
+# transparent logos: dark lettering for the light theme, white lettering for the dark one
+LOGOS = {mode: ROOT / "assets" / f"sentinalx_logo_{mode}.png" for mode in ("light", "dark")}
 
 st.set_page_config(page_title="SentinalX", layout="wide")
 
@@ -278,8 +279,8 @@ st.sidebar.text(f"LLM: {provider}" if provider else "LLM: none (no API key in en
 st.sidebar.text("python: fast worker pool\n" + "\n".join(
     f"{k}: {'found' if v else 'not on PATH, static check only'}" for k, v in toolchain().items()))
 
-if LOGO.exists():
-    st.image(str(LOGO), width=520)
+if LOGOS[theme_mode].exists():
+    st.image(str(LOGOS[theme_mode]), width=520)
 else:
     st.title("SentinalX")
 st.caption("SentinalX: defect prediction, bug localization and program repair")
