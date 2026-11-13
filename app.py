@@ -1,6 +1,10 @@
 ﻿import re
+import difflib
+import json
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,7 +15,7 @@ from src import benchmark, train_pipeline
 from src.acr_repair import DISCOVERED, REFERENCE, build_context, can_execute, llm_provider, repair, verify_with_pytest
 from src.ast_metrics import FEATURE_LABELS, FEATURES
 from src.line_localizer import load_token_model, rank_lines
-from src.quixbugs import faulty_lines, list_programs, program_path, read_buggy, read_correct
+from src.quixbugs import EXT, faulty_lines, list_programs, program_path, read_buggy, read_correct
 from src.sandbox import _balanced, run_tests, toolchain
 
 ROOT = Path(__file__).resolve().parent
@@ -138,34 +142,72 @@ def first_run(code, program, tests, timeout, lang):
     return run_tests(code, program, tests, timeout=timeout, fail_fast=True, lang=lang)
 
 
-# judge test cases for custom input mode: (python source, asserts)
+# one-click judge presets for custom input mode: (python source, asserts)
 QUICK_LOADS = {
-    "Load Off-by-One Bug": SAMPLES["python"],
-    "Load Mutable Default Bug": ('''def append_item(item, bucket=[]):
-    bucket.append(item)
-    return bucket
+    "Preset 1: Off-by-One Loop Bug": ('''def sum_up_to(n):
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+''', '''assert sum_up_to(0) == 0
+assert sum_up_to(1) == 1
+assert sum_up_to(3) == 6
+assert sum_up_to(10) == 55
+'''),
+    "Preset 2: Mutable Default Bug": ('''def append_item(item, items=[]):
+    items.append(item)
+    return items
 ''', '''assert append_item(1) == [1]
 assert append_item(2) == [2]
 assert append_item(3, [0]) == [0, 3]
 '''),
-    "Load Infinite Loop Timeout Test": ('''def count_set_bits(n):
-    count = 0
-    while n:
-        n ^= n - 1
-        count += 1
-    return count
-''', '''assert count_set_bits(5) == 2
-assert count_set_bits(8) == 1
-assert count_set_bits(0) == 0
+    # forgets n -= 1, so the sandbox has to kill it at the test budget
+    "Preset 3: Infinite Loop Sandbox Stress-Test": ('''def countdown_sum(n):
+    total = 0
+    while n > 0:
+        total += n
+    return total
+''', '''assert countdown_sum(0) == 0
+assert countdown_sum(3) == 6
+assert countdown_sum(5) == 15
 '''),
 }
 
 
 def quick_load(name):
+    """runs as a button callback, before the widgets are built, so the editors pick up the new text."""
     source, asserts = QUICK_LOADS[name]
     st.session_state["lang_select"] = "Python"
     st.session_state["code_python"] = source
     st.session_state["tests_python"] = asserts
+    st.session_state["preset"] = name
+    for key in ("fix", "runs", "timing"):
+        st.session_state.pop(key, None)
+
+
+def patch_path(program, lang):
+    if program:
+        return program_path(program, lang).relative_to(ROOT).as_posix()
+    return f"candidate{EXT[lang]}"
+
+
+def git_patch(before, after, path):
+    """unified diff with a diff --git header and no-newline markers, so `git apply` accepts it."""
+    out = [f"diff --git a/{path} b/{path}\n"]
+    for line in difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                     fromfile=f"a/{path}", tofile=f"b/{path}", n=3):
+        out.append(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
+    return "".join(out) if len(out) > 1 else ""
+
+
+def _plain(value):
+    return value.item() if hasattr(value, "item") else str(value)
+
+
+def run_summary(run):
+    if not run:
+        return None
+    return {k: run.get(k) for k in ("passed", "timed_out", "exit_code", "runtime_ms", "command")}
 
 
 def run_status(run):
@@ -225,9 +267,9 @@ st.title("Defect prediction, bug localization and program repair")
 if mode == "Custom Input":
     sample_code, sample_tests = SAMPLES[lang]
     label = next(k for k, v in LANGS.items() if v == lang)
-    st.caption("Quick-load a Python test case:")
+    st.caption("Judge presets (Python): load a known bug and its assert tests into the editors.")
     for col, name in zip(st.columns(len(QUICK_LOADS)), QUICK_LOADS):
-        col.button(name, on_click=quick_load, args=(name,), width="stretch")
+        col.button(f"[{name}]", key=f"preset_{name}", on_click=quick_load, args=(name,), width="stretch")
     left, right = st.columns(2)
     # keyed per language so switching the selector loads that language's template
     st.session_state.setdefault(f"code_{lang}", sample_code)
@@ -274,11 +316,12 @@ m3.caption(f"{baseline['runtime_ms']:.0f} ms" if baseline else "no runnable test
 m4.metric("Repair backend", provider or "AST search")
 m4.caption("llm then single-edit search" if provider else "no API key, single-edit search only")
 
-tab_pred, tab_loc, tab_fix, tab_bench = st.tabs([
+tab_pred, tab_loc, tab_fix, tab_bench, tab_adr = st.tabs([
     "Defect Prediction & SHAP",
     "Line Localization (DeepLineDP + AST)",
     "Program Repair & Test Sandbox (AutoCodeRover)",
     "Benchmark Evaluation",
+    "Architecture & ADR",
 ])
 
 with tab_pred:
@@ -394,17 +437,47 @@ with tab_fix:
                 + " Patches are still proposed; the sandbox falls back to a static bracket check.")
     use_llm = st.checkbox("Use LLM when an API key is set", value=bool(provider), disabled=not provider)
     if st.button("Generate patch and run pytest"):
+        st.session_state.pop("runs", None)
+        start = time.perf_counter()
         with st.spinner("searching for a patch"):
             fix = repair(code, program_name=program, assert_block=tests, ranked=ranked, use_llm=use_llm,
                          timeout=timeout, lang=lang, failure_output=failure)
+        repair_ms = (time.perf_counter() - start) * 1000.0
         st.session_state["fix"] = (code, fix)
+        start = time.perf_counter()
         if fix["patched"]:
             with st.spinner("running the tests on both versions"):
                 st.session_state["runs"] = verify_with_pytest(program, code, fix["patched"], tests, timeout, lang)
+        elif can_test:
+            # no patch, but still run the original in the sandbox so a hang or failure is visible
+            with st.spinner("running the tests on the original"):
+                st.session_state["runs"] = {"before": run_tests(code, test_program, tests, timeout, False, lang),
+                                            "after": None}
+        st.session_state["timing"] = {"repair_search_ms": round(repair_ms, 1),
+                                      "verification_wall_ms": round((time.perf_counter() - start) * 1000.0, 1)}
+
+    def audit_record(fix, runs):
+        return {
+            "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "input": {"mode": mode, "program": program, "language": lang, "path": patch_path(program, lang),
+                      "preset": st.session_state.get("preset") if mode == "Custom Input" else None},
+            "classifier": {"model": model_label, "defect_probability": round(float(info["probability"]), 6)},
+            "jm1_metrics": {f: info["features"][f] for f in FEATURES},
+            "top3_suspicious_lines": [{k: r[k] for k in ("rank", "line_no", "code", "suspicion_score", "token_score",
+                                                         "ast_score", "ast_node_type", "signals") if k in r}
+                                      for r in ranked[:3]],
+            "patch": {"origin": fix["origin"], "source": fix["source"], "validated_by_tests": fix["validated"],
+                      "counts_as_autonomous_repair": fix["origin"] == DISCOVERED and bool(fix["validated"]),
+                      "fault_lines_sent_to_repair": fix["fault_lines"], "log": fix["log"]},
+            "pytest_execution_ms": {"test_budget_s": timeout, **st.session_state.get("timing", {}),
+                                    "original": run_summary((runs or {}).get("before")),
+                                    "patched": run_summary((runs or {}).get("after"))},
+        }
 
     saved = st.session_state.get("fix")
     if saved and saved[0] == code:
         fix = saved[1]
+        runs = st.session_state.get("runs")
         st.text("\n".join(fix["log"]))
         if not fix["patched"]:
             if lang != "python" and not can_test:
@@ -412,6 +485,15 @@ with tab_fix:
                            "against the asserts, or an API key for the LLM path.")
             else:
                 st.warning("No patch produced. Add assert tests, or set an API key for the LLM path.")
+            if runs and runs.get("before"):
+                st.subheader("Test sandbox")
+                run_block(st, "Original", runs["before"])
+                if runs["before"]["timed_out"]:
+                    st.caption(f"The sandbox killed the run after the {timeout:.1f}s budget. The Streamlit process "
+                               "was not blocked: tests execute in a separate interpreter.")
+            st.download_button("Download Verification Audit (.json)",
+                               json.dumps(audit_record(fix, runs), indent=2, default=_plain),
+                               file_name="verification_audit.json", mime="application/json")
         else:
             if fix["origin"] == REFERENCE:
                 st.warning("REFERENCE FALLBACK. The tool did not find this patch. It is the known fix copied from "
@@ -423,6 +505,14 @@ with tab_fix:
             st.caption(f"Suspect lines sent to repair: {fix['fault_lines']}.")
             st.subheader("Unified diff")
             st.code(fix["diff"] or "(no textual change)", language="diff")
+            path = patch_path(program, lang)
+            d1, d2 = st.columns(2)
+            d1.download_button("Download Unified Patch (.patch)", git_patch(code, fix["patched"], path),
+                               file_name=f"{Path(path).stem}.patch", mime="text/x-diff", width="stretch",
+                               help=f"Apply from the repository root with: git apply {Path(path).stem}.patch")
+            d2.download_button("Download Verification Audit (.json)",
+                               json.dumps(audit_record(fix, runs), indent=2, default=_plain),
+                               file_name="verification_audit.json", mime="application/json", width="stretch")
             a, b = st.columns(2)
             a.subheader("Original")
             a.code(code, language=HIGHLIGHT[lang], line_numbers=True)
@@ -430,7 +520,6 @@ with tab_fix:
             b.code(fix["patched"], language=HIGHLIGHT[lang], line_numbers=True)
 
             st.subheader("Test sandbox")
-            runs = st.session_state.get("runs")
             if not runs:
                 st.info("No tests available for this input, so the patch was not executed.")
             else:
@@ -488,3 +577,34 @@ with tab_bench:
         st.dataframe(df.style.apply(shade, axis=1), hide_index=True, width="stretch")
         st.caption("Green = discovered by the tool. Yellow = reference fallback. Python line hits use leave-one-out "
                    "token weights.")
+
+with tab_adr:
+    st.subheader("Pipeline")
+    st.graphviz_chart('''
+digraph pipeline {
+    rankdir=LR;
+    bgcolor="transparent";
+    node [shape=box, style="rounded", fontname="Helvetica", fontsize=11, color="#A1A1AA", fontcolor="#18181B",
+          margin="0.18,0.10"];
+    edge [color="#EA580C", arrowsize=0.7, fontname="Helvetica", fontsize=9, fontcolor="#555555"];
+    src [label="Source file\n(QuixBugs or custom)", shape=note];
+    s1 [label="1. AST Telemetry\n18 JM1 columns (Halstead, McCabe, LOC)\n+ 11 Python AST structure counts"];
+    s2 [label="2. XGBoost / Random Forest\n+ SHAP TreeExplainer\nfile-level defect probability"];
+    s3 [label="3. DeepLineDP Token Localizer\n+ AST rule signals\nTop-3 suspicious lines"];
+    s4 [label="4. AST Context Slicer\n+ Isolated Pytest Subprocess\npatch search, per-run time budget"];
+    out [label="Verified patch + audit\n(.patch, .json)", shape=note];
+    src -> s1 -> s2 -> s3 -> s4 -> out;
+    s4 -> s4 [label="  candidate edits"];
+}
+''', width="stretch")
+    st.caption("Stages 1 to 3 are static and deterministic. Stage 4 is the only place code executes, and it runs "
+               "in a separate interpreter that is killed when it exceeds the test budget.")
+
+    st.subheader("Architecture Decision Record")
+    st.markdown('''
+| ID | Decision | Context | Choice | Trade-off accepted |
+|---|---|---|---|---|
+| ADR-1 | Hybrid AST + ML instead of an end-to-end LLM wrapper | A raw LLM wrapper returns a patch with no evidence for where the bug is, no reproducible score, and no guarantee the patch runs. Output changes between calls. | Deterministic AST features feed tree ensembles whose SHAP values explain each score. The localizer narrows repair to three lines and the AST slicer sends only that context. Every patch, including an optional LLM patch, must pass tests in the sandbox before it is accepted. | Single-edit search cannot express large multi-line rewrites. The optional LLM step covers those, and it is held to the same test gate. |
+| ADR-2 | Bridge the C-to-Python NASA JM1 domain shift | JM1 metrics were extracted from C modules. Python has different operators, no braces, and different idioms, so a model fit on C rows does not transfer. | Re-implement the 18 JM1 column definitions over the Python AST so the schema is shared, add 11 Python-only structure counts, and train on QuixBugs buggy/correct pairs plus test-verified mutants and refactors. Splits are grouped by program so no variant of a holdout program is seen in training. The JM1-on-C model is kept only as a reported baseline on the same holdout. | The Python training set is far smaller than JM1, and original buggy/fixed pairs often share identical metrics. The holdout table reports that hard slice separately instead of hiding it in the average. |
+| ADR-3 | Separate autonomous repairs from reference fallbacks | For QuixBugs programs the known fix exists on disk. Copying it would make the repair rate look close to 100 percent. | A patch is DISCOVERED only when the LLM or AST search produced it without the reference file. The reference fix is labelled REFERENCE FALLBACK, shown in a separate column, and excluded from discovered-repair counts in the benchmark and the audit JSON. | Headline repair numbers are lower, but every counted repair is reproducible and was verified by tests. |
+''')
