@@ -106,7 +106,7 @@ git clone https://github.com/pavankm7523-hue/yuktik-ps12.git
 cd yuktik-ps12
 
 # 2. (Optional) Configure Gemini API key for live LLM repair synthesis
-\$env:GEMINI_api_key="YOUR_API_KEY"
+$env:GEMINI_API_KEY="YOUR_API_KEY"
 
 # 3. Launch the interactive workbench
 python -m streamlit run app.py
